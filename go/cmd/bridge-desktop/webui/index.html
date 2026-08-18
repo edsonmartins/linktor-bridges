@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Linktor Bridge</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: system-ui, -apple-system, sans-serif;
+    background: #0f1220; color: #e6e8f0; min-height: 100vh;
+  }
+  main { max-width: 560px; margin: 0 auto; padding: 32px 20px 80px; }
+  h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: .2px; }
+  .sub { color: #8b90a5; font-size: 13px; margin-bottom: 24px; }
+  .card {
+    background: #1a1e32; border: 1px solid #282d47; border-radius: 12px;
+    padding: 20px; margin-bottom: 16px;
+  }
+  .card h2 { font-size: 14px; margin: 0 0 12px; color: #b9c0d8; text-transform: uppercase; letter-spacing: .6px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .badge { font-size: 12px; padding: 3px 10px; border-radius: 999px; }
+  .badge.ok { background: #143d28; color: #46e08a; }
+  .badge.no { background: #3d1518; color: #ff6b6b; }
+  input[type=text] {
+    flex: 1; min-width: 160px; background: #11142a; border: 1px solid #2c3152;
+    color: #e6e8f0; padding: 9px 12px; border-radius: 8px; font-size: 14px;
+  }
+  button {
+    background: #2e78d2; color: #fff; border: 0; padding: 9px 16px;
+    border-radius: 8px; font-size: 14px; cursor: pointer;
+  }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.ghost { background: #262b47; color: #d5d9ef; }
+  button.danger { background: #7d2430; }
+  .qr-wrap { display: flex; justify-content: center; padding: 8px 0; }
+  img.qr { width: 232px; height: 232px; border-radius: 8px; background: #fff; padding: 8px; }
+  pre.log {
+    background: #0c0f1f; border: 1px solid #242a48; border-radius: 8px;
+    padding: 12px; font-size: 12px; max-height: 260px; overflow: auto; white-space: pre-wrap;
+  }
+  #out { margin-top: 12px; font-size: 13px; color: #8b90a5; word-break: break-word; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Linktor Bridge</h1>
+  <div class="sub">WhatsApp Multi-Device pareado localmente nesta máquina.</div>
+
+  <section class="card" id="statusCard">
+    <h2>Status da Conexão</h2>
+    <div class="row">
+      <span class="badge no" id="bPaired">Verificando…</span>
+      <span class="badge no" id="bConnected">—</span>
+      <span id="sNumber"></span>
+    </div>
+    <div id="sHint" class="sub" style="margin: 10px 0 0">
+      Conecte sua conta WhatsApp para receber mensagens.
+    </div>
+    <div id="sError" style="color:#ff6b6b;margin-top:8px"></div>
+  </section>
+
+  <section class="card" id="pairCard">
+    <h2>Conectar sua conta WhatsApp</h2>
+    <div class="row">
+      <button id="btnQr">Conectar com QR Code</button>
+    </div>
+    <div class="qr-wrap" id="qrWrap" hidden>
+      <img class="qr" id="qrImg" alt="QR code">
+      <div class="sub">Abra WhatsApp > Dispositivos conectados > Conectar dispositivo e escaneie.</div>
+    </div>
+    <div class="sub" style="margin-top:14px">Ou use o número de telefone</div>
+    <div class="row" style="margin-top:6px">
+      <input type="text" id="phone" placeholder="+55 11 99999-9999">
+      <button class="ghost" id="btnCode">Obter Código de Pareamento</button>
+    </div>
+    <div class="sub" style="margin-top:6px">Inclua o código do país (ex: +55 para Brasil)</div>
+    <div class="row" style="margin-top:8px">
+      <button class="danger" id="btnCancel">Cancelar pareamento</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Envio de teste</h2>
+    <div class="row">
+      <input type="text" id="sendTo" placeholder="Destino (número ou JID)">
+      <input type="text" id="sendText" placeholder="Texto">
+      <button id="btnSend">Enviar</button>
+    </div>
+    <div id="out"></div>
+  </section>
+
+  <section class="card">
+    <h2>Eventos recebidos (inbound)</h2>
+    <div class="row">
+      <button class="ghost" id="btnConn">Conectar</button>
+      <button class="ghost" id="btnDisc">Desconectar</button>
+      <button class="danger" id="btnRefresh">Atualizar</button>
+    </div>
+    <pre class="log" id="log">(aguardando…)</pre>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const http = async (method, url, body) => {
+  const res = await fetch(url, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) throw new Error((await res.text()) || res.statusText);
+  return res.json();
+};
+
+async function refresh() {
+  try {
+    const s = await http("GET", "/api/status");
+    $("bPaired").textContent = s.paired ? "Pareado" : "Não pareado";
+    $("bPaired").className = "badge " + (s.paired ? "ok" : "no");
+    $("bConnected").textContent = s.connected ? "Conectado" : "Desconectado";
+    $("bConnected").className = "badge " + (s.connected ? "ok" : "no");
+    $("sNumber").textContent = s.number || "";
+    $("sError").textContent = s.last_error || "";
+    $("sHint").hidden = s.paired;
+    $("pairCard").hidden = s.paired;
+    if (s.qr_active) { $("qrWrap").hidden = false; $("qrImg").src = "/api/qr.png?" + Date.now(); }
+  } catch (err) {
+    $("sError").textContent = "Erro: " + err.message;
+  }
+  try {
+    const events = await http("GET", "/api/inbound");
+    const lines = Array.isArray(events) ? events.map(e => JSON.stringify(e)).join("\n") : JSON.stringify(events);
+    $("log").textContent = lines && lines !== "[]" ? lines : "(sem eventos)";
+  } catch (_) {}
+}
+
+$("btnQr").onclick = async () => {
+  try {
+    await http("POST", "/api/pair/qr");
+    $("qrWrap").hidden = false;
+    $("qrImg").src = "/api/qr.png?" + Date.now();
+    $("out").textContent = "Abra o WhatsApp > Dispositivos conectados > Conectar dispositivo e escaneie o QR.";
+  } catch (err) { $("out").textContent = "Erro: " + err.message; }
+};
+
+$("btnCode").onclick = async () => {
+  try {
+    const r = await http("POST", "/api/pair/code", { phone: $("phone").value });
+    $("out").textContent = "Abra o WhatsApp no número " + $("phone").value + " e digite o código: " + r.code;
+  } catch (err) { $("out").textContent = "Erro: " + err.message; }
+};
+
+$("btnCancel").onclick = async () => { await http("POST", "/api/pair/cancel"); refresh(); };
+$("btnConn").onclick = async () => { try { await http("POST", "/api/connect"); } catch (e) { $("out").textContent = e.message; } refresh(); };
+$("btnDisc").onclick = async () => { await http("POST", "/api/disconnect"); refresh(); };
+$("btnRefresh").onclick = refresh;
+$("btnSend").onclick = async () => {
+  try {
+    const r = await http("POST", "/api/send", { to: $("sendTo").value, text: $("sendText").value });
+    $("out").textContent = "Enviada. message_id=" + r.message_id;
+  } catch (err) { $("out").textContent = "Erro: " + err.message; }
+};
+
+refresh();
+setInterval(refresh, 4000);
+</script>
+</body>
+</html>
