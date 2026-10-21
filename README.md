@@ -1,7 +1,7 @@
 # Linktor Bridge
 
 Bridges de WhatsApp Multi-Device que rodam **no device do usuário** (Android ou
-PC Windows/Linux/macOS) e conectam o [Linktor](https://github.com/msgfy/linktor)
+PC Windows/Linux/macOS) e conectam o [Linktor](https://github.com/edsonmartins/linktor)
 ao WhatsApp por WebSocket — mantendo a sessão onde o WhatsApp Web já é usado.
 
 ![Arquitetura Linktor Bridge](docs/linktor_bridges_diagrama.png)
@@ -68,7 +68,7 @@ O resultado:
 ## Estrutura
 
 ```text
-bridges/
+linktor-bridges/
 ├── go/                              # módulo Go compartilhado
 │   ├── wacore/                      # core único autorizado a importar whatsmeow
 │   │   ├── core.go                  #   pairing QR/código, connect, send, inbound
@@ -138,8 +138,8 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -o bin/bridge-linux-amd64 ./cmd/b
 
 ```bash
 export ANDROID_HOME=/caminho/para/Android/sdk
-./scripts/build-aar.sh          # gera android/app/libs/wacore.aar
-./gradlew :app:assembleDebug    # na pasta android/
+./scripts/build-aar.sh                  # gera android/app/libs/wacore.aar
+./gradlew -p android :app:assembleDebug # o wrapper fica na raiz; o projeto Gradle, em android/
 ```
 
 Instale `android/app/build/outputs/apk/debug/app-debug.apk` no aparelho.
@@ -182,6 +182,14 @@ go build ./cmd/bridge-desktop
 - [ ] Bridge Android: agent completo via AAR (inbound/outbound/heartbeat)
 - [ ] Instaladores desktop (MSI/dmg/deb) + autostart na bandeja
 - [ ] Reconexão do embedded whatsmeow não sobrescrever `RemoteAdapter` (race)
+
+## Contribuição
+
+Contribuições são bem-vindas! Antes de abrir um PR, leia o [guia de contribuição](CONTRIBUTING.md): ele cobre ambiente, validação, padrão de commits e a assinatura DCO (`git commit -s`).
+
+## Licença
+
+[Apache License 2.0](LICENSE)
 
 > **Aviso:** `whatsmeow` implementa o protocolo WhatsApp Web/Multi-Device e não é
 > API oficial da Meta. Use contas/números de teste. Risco operacional existente.
