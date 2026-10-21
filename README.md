@@ -183,5 +183,13 @@ go build ./cmd/bridge-desktop
 - [ ] Instaladores desktop (MSI/dmg/deb) + autostart na bandeja
 - [ ] Reconexão do embedded whatsmeow não sobrescrever `RemoteAdapter` (race)
 
+## Contribuição
+
+Contribuições são bem-vindas! Antes de abrir um PR, leia o [guia de contribuição](CONTRIBUTING.md): ele cobre ambiente, validação, padrão de commits e a assinatura DCO (`git commit -s`).
+
+## Licença
+
+[Apache License 2.0](LICENSE)
+
 > **Aviso:** `whatsmeow` implementa o protocolo WhatsApp Web/Multi-Device e não é
 > API oficial da Meta. Use contas/números de teste. Risco operacional existente.
