@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,7 @@ import (
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 
 	"go.mau.fi/whatsmeow"
@@ -48,6 +50,9 @@ type core struct {
 	pairCtx   context.Context
 	pairStop  context.CancelFunc
 	pairError string
+	// currentQR é o último código emitido pelo WhatsApp. O servidor troca o
+	// código a cada ~20s; quem mostra o QR precisa ler sempre o atual.
+	currentQR string
 
 	inbound []InboundEvent
 }
@@ -60,9 +65,12 @@ type InboundEvent struct {
 	From       string `json:"from,omitempty"`
 	SenderName string `json:"sender_name,omitempty"`
 	Chat       string `json:"chat,omitempty"`
-	Text       string `json:"text,omitempty"`
-	Timestamp  int64  `json:"ts,omitempty"`
-	Summary    string `json:"summary,omitempty"`
+	// SenderLID é o endereço LID do remetente quando o WhatsApp o usou no
+	// lugar do número; From traz o número (PN) sempre que for conhecido.
+	SenderLID string `json:"sender_lid,omitempty"`
+	Text      string `json:"text,omitempty"`
+	Timestamp int64  `json:"ts,omitempty"`
+	Summary   string `json:"summary,omitempty"`
 }
 
 // CallEventKind enumerates the call signaling events surfaced by the bridge.
@@ -139,6 +147,15 @@ func PairingError() string {
 	singleton.mu.Lock()
 	defer singleton.mu.Unlock()
 	return singleton.pairError
+}
+
+// CurrentQR returns the QR code currently valid for pairing, or "" when no QR
+// pairing is active. The code rotates while pairing runs, so callers should
+// re-read it instead of caching the first value.
+func CurrentQR() string {
+	singleton.mu.Lock()
+	defer singleton.mu.Unlock()
+	return singleton.currentQR
 }
 
 // CancelPairing stops an active QR or phone-code flow.
@@ -263,7 +280,9 @@ func (c *core) initialize(dataDir string) error {
 		return fmt.Errorf("load device: %w", err)
 	}
 
-	client := whatsmeow.NewClient(device, nil)
+	// Log do protocolo em INFO: sem ele uma falha de pareamento (versão
+	// recusada, 405, etc.) não deixa rastro nenhum.
+	client := whatsmeow.NewClient(device, waLog.Stdout("whatsmeow", "INFO", true))
 	client.EnableAutoReconnect = true
 	client.AutoTrustIdentity = true
 	client.AddEventHandler(c.handleEvent)
@@ -280,20 +299,62 @@ func configureDeviceIdentity() {
 	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_CHROME.Enum()
 }
 
+// resolveSender devolve o JID de número (PN) do remetente e, quando ele veio
+// como LID, o LID original. Sem mapeamento conhecido, devolve o LID mesmo.
+func (c *core) resolveSender(sender, alt types.JID) (types.JID, string) {
+	if sender.Server != types.HiddenUserServer {
+		return sender, ""
+	}
+	lid := sender.String()
+	if alt.Server == types.DefaultUserServer && alt.User != "" {
+		return alt.ToNonAD(), lid
+	}
+	if c.client != nil && c.client.Store != nil && c.client.Store.LIDs != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if pn, err := c.client.Store.LIDs.GetPNForLID(ctx, sender); err == nil && pn.User != "" {
+			return pn.ToNonAD(), lid
+		}
+	}
+	return sender, lid
+}
+
 func (c *core) handleEvent(evt any) {
 	var event InboundEvent
 	switch v := evt.(type) {
 	case *events.Message:
-		text := v.Message.GetConversation()
-		if text == "" {
+		// Mensagens enviadas pelo próprio celular pareado não são "recebidas":
+		// voltariam ao Linktor como se fossem do cliente.
+		if v.Info.IsFromMe {
 			return
 		}
+		// Texto simples chega como Conversation; com prévia de link, resposta
+		// citada ou em vários clientes atuais, como ExtendedTextMessage.
+		text := v.Message.GetConversation()
+		if text == "" {
+			text = v.Message.GetExtendedTextMessage().GetText()
+		}
+		if text == "" {
+			log.Printf("wacore: mensagem sem texto ignorada (id=%s de %s)", v.Info.ID, v.Info.Sender.String())
+			return
+		}
+		// Remetente em LID: o Linktor identifica o contato pelo número, então
+		// traduz para o PN quando o WhatsApp informa (SenderAlt) ou quando o
+		// mapeamento já está na sessão. Sem tradução, segue o LID e a resposta
+		// volta por ele.
+		sender, senderLID := c.resolveSender(v.Info.Sender, v.Info.SenderAlt)
+		chat := v.Info.Chat
+		if chat.Server == types.HiddenUserServer && chat.User == v.Info.Sender.User {
+			chat = sender
+		}
+		log.Printf("wacore: mensagem recebida (id=%s de %s lid=%s)", v.Info.ID, sender.String(), senderLID)
 		event = InboundEvent{
 			Type:       "message",
 			MessageID:  v.Info.ID,
-			From:       v.Info.Sender.String(),
+			From:       sender.String(),
 			SenderName: v.Info.PushName,
-			Chat:       v.Info.Chat.String(),
+			Chat:       chat.String(),
+			SenderLID:  senderLID,
 			Text:       text,
 			Timestamp:  v.Info.Timestamp.Unix(),
 		}
@@ -309,6 +370,15 @@ func (c *core) handleEvent(evt any) {
 		event = callEvent(CallReject, v.From, v.CallID, v.Timestamp)
 	case *events.CallTerminate:
 		event = callEvent(CallTerminate, v.From, v.CallID, v.Timestamp)
+	case *events.PairSuccess:
+		log.Printf("wacore: pareado como %s (%s)", v.ID.String(), v.Platform)
+		return
+	case *events.PairError:
+		log.Printf("wacore: pareamento falhou: %v", v.Error)
+		c.mu.Lock()
+		c.pairError = "pairing failed: " + v.Error.Error()
+		c.mu.Unlock()
+		return
 	case *events.LoggedOut:
 		event = InboundEvent{Type: "logout", Summary: "session revoked"}
 	case *events.Connected:
@@ -348,6 +418,7 @@ func (c *core) beginPairing() (string, error) {
 	for item := range qrChannel {
 		switch item.Event {
 		case whatsmeow.QRChannelEventCode:
+			c.currentQR = item.Code
 			go c.monitorPairing(qrChannel)
 			return item.Code, nil
 		case whatsmeow.QRChannelEventError:
@@ -430,12 +501,23 @@ func (c *core) startPairingLocked() (<-chan whatsmeow.QRChannelItem, error) {
 }
 
 func (c *core) monitorPairing(qrChannel <-chan whatsmeow.QRChannelItem) {
+	defer func() {
+		c.mu.Lock()
+		c.currentQR = ""
+		c.mu.Unlock()
+	}()
 	for item := range qrChannel {
 		if item.Event == whatsmeow.QRChannelSuccess.Event {
 			return
 		}
 		var message string
 		switch item.Event {
+		case whatsmeow.QRChannelEventCode:
+			// Código novo: o anterior já não vale no WhatsApp.
+			c.mu.Lock()
+			c.currentQR = item.Code
+			c.mu.Unlock()
+			continue
 		case whatsmeow.QRChannelEventError:
 			message = "pairing failed"
 			if item.Error != nil {
@@ -511,6 +593,7 @@ func (c *core) closeLocked() error {
 }
 
 func (c *core) cancelPairingLocked() {
+	c.currentQR = ""
 	if c.pairStop != nil {
 		c.pairStop()
 		c.pairStop = nil
@@ -563,8 +646,8 @@ func normalizeDestination(raw string) (types.JID, error) {
 	value := strings.TrimSpace(raw)
 	if strings.Contains(value, "@") {
 		jid, err := types.ParseJID(value)
-		if err != nil || jid.User == "" || jid.Server != types.DefaultUserServer {
-			return types.EmptyJID, errors.New("invalid destination JID; use a user JID such as 5511999999999@s.whatsapp.net")
+		if err != nil || jid.User == "" || (jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer) {
+			return types.EmptyJID, errors.New("invalid destination JID; use a user JID such as 5511999999999@s.whatsapp.net or a @lid address")
 		}
 		return jid, nil
 	}
