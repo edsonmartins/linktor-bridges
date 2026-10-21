@@ -15,5 +15,5 @@
 - [ ] Commits assinados com `git commit -s` (DCO)
 - [ ] Testes adicionados ou atualizados
 - [ ] `gofmt`, `go vet ./...`, `go test ./...` e `go build ./cmd/bridge-desktop` passam (em `go/`)
-- [ ] `./scripts/build-aar.sh` e `./gradlew :app:assembleDebug` passam (se mexeu no Android ou no `wacore`)
+- [ ] `./scripts/build-aar.sh` e `./gradlew -p android :app:assembleDebug` passam (se mexeu no Android ou no `wacore`)
 - [ ] `docs/PROTOCOL.md` atualizado (se mudou algum frame do protocolo)

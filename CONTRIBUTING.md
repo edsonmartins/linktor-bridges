@@ -34,7 +34,7 @@ go build ./cmd/bridge-desktop
 # Android (se mexeu em android/ ou go/wacore), a partir da raiz
 cd ..
 ./scripts/build-aar.sh
-./gradlew :app:assembleDebug
+./gradlew -p android :app:assembleDebug
 ```
 
 Inclua testes para o que mudou. Correção de bug vem com um teste que falhava antes e passa depois. O `agent` tem testes contra um servidor WS mockado: use-os de modelo para mudanças no protocolo.

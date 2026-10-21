@@ -1,7 +1,7 @@
 # Linktor Bridge
 
 Bridges de WhatsApp Multi-Device que rodam **no device do usuário** (Android ou
-PC Windows/Linux/macOS) e conectam o [Linktor](https://github.com/msgfy/linktor)
+PC Windows/Linux/macOS) e conectam o [Linktor](https://github.com/edsonmartins/linktor)
 ao WhatsApp por WebSocket — mantendo a sessão onde o WhatsApp Web já é usado.
 
 ![Arquitetura Linktor Bridge](docs/linktor_bridges_diagrama.png)
@@ -68,7 +68,7 @@ O resultado:
 ## Estrutura
 
 ```text
-bridges/
+linktor-bridges/
 ├── go/                              # módulo Go compartilhado
 │   ├── wacore/                      # core único autorizado a importar whatsmeow
 │   │   ├── core.go                  #   pairing QR/código, connect, send, inbound
@@ -138,8 +138,8 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -o bin/bridge-linux-amd64 ./cmd/b
 
 ```bash
 export ANDROID_HOME=/caminho/para/Android/sdk
-./scripts/build-aar.sh          # gera android/app/libs/wacore.aar
-./gradlew :app:assembleDebug    # na pasta android/
+./scripts/build-aar.sh                  # gera android/app/libs/wacore.aar
+./gradlew -p android :app:assembleDebug # o wrapper fica na raiz; o projeto Gradle, em android/
 ```
 
 Instale `android/app/build/outputs/apk/debug/app-debug.apk` no aparelho.
