@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/gen2brain/beeep"
-	"github.com/getlantern/systray"
 
 	"whatsbridge/wacore"
 )
@@ -70,12 +69,7 @@ func (m *statusMonitor) check() {
 	default:
 		tooltip += "DESCONECTADO"
 	}
-	systray.SetTooltip(tooltip)
-	if st.Connected {
-		systray.SetTitle("Linktor Bridge ✓")
-	} else {
-		systray.SetTitle("Linktor Bridge ⚠")
-	}
+	trayStatus(tooltip, st.Connected)
 
 	// Alert only when the bridge stays disconnected past the grace period.
 	now := time.Now()

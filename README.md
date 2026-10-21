@@ -130,6 +130,19 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o bin/bridge-windows-amd64.exe
 GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -o bin/bridge-linux-amd64 ./cmd/bridge-desktop
 ```
 
+### Sem bandeja (Linux sem GTK/cgo, servidores, CI)
+
+```bash
+CGO_ENABLED=0 go build -tags notray -o linktor-bridge ./cmd/bridge-desktop
+./linktor-bridge --server wss://host/api/v1/gateways/ws --channel-id <id> --token <token>
+```
+
+Com `-tags notray` a bandeja fica de fora e o binário é 100% Go: o painel
+continua em `127.0.0.1:<porta>` (a URL sai no terminal), o monitor de status
+loga as mudanças e Ctrl+C encerra. Notificações nativas seguem funcionando onde
+houver `notify-send`/D-Bus.
+
+
 > A bandeja usa `getlantern/systray` (AppKit no macOS, X11 no Linux, nativo no
 > Windows), por isso só o Windows tem build 100% pure-Go. O restante do binário
 > (whatsmeow, sqlite modernc) é pure-Go — o cgo é apenas da bandeja.
