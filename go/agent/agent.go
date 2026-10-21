@@ -68,6 +68,40 @@ type Agent struct {
 
 	mu         sync.Mutex
 	lastStatus []byte
+
+	// Estado da ligação com o gateway, para o painel mostrar se o bridge está
+	// de fato falando com o Linktor (o "conectado" do WhatsApp é outra coisa).
+	connected   bool
+	connectedAt time.Time
+	lastError   string
+}
+
+// State é o retrato da ligação com o gateway.
+type State struct {
+	Connected   bool      `json:"connected"`
+	ConnectedAt time.Time `json:"connected_at,omitempty"`
+	LastError   string    `json:"last_error,omitempty"`
+}
+
+// State devolve o estado atual da ligação com o gateway.
+func (a *Agent) State() State {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return State{Connected: a.connected, ConnectedAt: a.connectedAt, LastError: a.lastError}
+}
+
+func (a *Agent) setConnected(ok bool, err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.connected = ok
+	if ok {
+		a.connectedAt = time.Now()
+		a.lastError = ""
+		return
+	}
+	if err != nil {
+		a.lastError = err.Error()
+	}
 }
 
 // New creates an Agent. server must be non-nil.
@@ -99,6 +133,7 @@ func (a *Agent) Run(ctx context.Context) {
 		}
 
 		err := a.runOnce(ctx)
+		a.setConnected(false, err)
 		if ctx.Err() != nil {
 			return
 		}
@@ -249,6 +284,7 @@ func (a *Agent) handleFrame(ctx context.Context, conn *Conn, data []byte) error 
 			return fmt.Errorf("welcome rejected: %s", f.Error)
 		}
 		log.Printf("agent: welcome ok")
+		a.setConnected(true, nil)
 		if a.cfg.Outbound != nil {
 			go a.serveEvents(ctx, conn)
 		}

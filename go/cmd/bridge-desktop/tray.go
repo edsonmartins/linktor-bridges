@@ -7,7 +7,6 @@ import (
 	"image"
 	"image/color"
 	"image/png"
-	"time"
 
 	"github.com/getlantern/systray"
 
@@ -54,13 +53,12 @@ func onReady(dashboard string) {
 			case <-mOpen.ClickedCh:
 				openBrowser(dashboard)
 			case <-mPair.ClickedCh:
-				qr, err := wacore.BeginPairing()
-				if err != nil {
+				if _, err := wacore.BeginPairing(); err != nil {
 					fmt.Printf("pairing not started: %v\n", err)
 					continue
 				}
-				lastQR.payload, lastQR.at = qr, time.Now()
 				fmt.Printf("pairing QR ready: %s\n", dashboard)
+				openBrowser(dashboard)
 			case <-mQuit.ClickedCh:
 				shutdown()
 				systray.Quit()

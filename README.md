@@ -130,11 +130,28 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o bin/bridge-windows-amd64.exe
 GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -o bin/bridge-linux-amd64 ./cmd/bridge-desktop
 ```
 
+### Configuração (painel ou flags)
+
+Na primeira execução o bridge sobe sem ligação com o Linktor e o painel pede
+três campos no bloco **Linktor**: a URL do gateway (`wss://host/api/v1/gateways/ws`),
+o ID do canal `whatsapp_remote` e o token gerado em
+`POST /api/v1/channels/:id/bridge-token`. Ao salvar, ele grava
+`~/.linktor/linktor-bridge/config.json` (permissão `0600`) e liga na hora; nas
+execuções seguintes lê o arquivo e liga sozinho. Os flags `--server`,
+`--channel-id` e `--token` continuam valendo, sobrepõem o arquivo e também são
+gravados nele.
+
+O painel escuta em `127.0.0.1:7788` por padrão (`--listen` ou `"listen"` no
+`config.json` trocam; se a porta estiver ocupada ele avisa e usa uma livre). O
+bloco Linktor mostra se o bridge está de fato conectado ao gateway, separado
+do estado do WhatsApp. **Desconectar e esquecer** apaga a ligação com o Linktor
+sem desparear o WhatsApp.
+
 ### Sem bandeja (Linux sem GTK/cgo, servidores, CI)
 
 ```bash
 CGO_ENABLED=0 go build -tags notray -o linktor-bridge ./cmd/bridge-desktop
-./linktor-bridge --server wss://host/api/v1/gateways/ws --channel-id <id> --token <token>
+./linktor-bridge            # painel em http://127.0.0.1:7788; configure o Linktor por lá
 ```
 
 Com `-tags notray` a bandeja fica de fora e o binário é 100% Go: o painel
