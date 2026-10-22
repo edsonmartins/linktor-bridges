@@ -461,6 +461,7 @@ func (c *core) handleEvent(evt any) {
 		// manutenção do protocolo. O Linktor casa os IDs com o que enviou e
 		// ignora o resto.
 		status := receiptStatus(v.Type)
+		log.Printf("wacore: recibo %q (%s) de %s para %d id(s): %v", v.Type, status, v.Chat.String(), len(v.MessageIDs), v.MessageIDs)
 		if status == "" || len(v.MessageIDs) == 0 {
 			return
 		}
