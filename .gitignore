@@ -7,3 +7,7 @@ android/app/libs/*.jar
 tools/bin/
 *.log
 /go/bridge-desktop
+
+# binário local do bridge desktop
+go/linktor-bridge
+go/linktor-bridge.exe
