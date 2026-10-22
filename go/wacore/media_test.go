@@ -200,3 +200,29 @@ func TestLocationForwarded(t *testing.T) {
 		t.Fatalf("ao vivo: %+v %+v", live, live.Location)
 	}
 }
+
+// Recibo de entrega/leitura vira evento receipt com os IDs; os demais tipos
+// (sender, retry, read-self) não geram nada.
+func TestReceiptForwarded(t *testing.T) {
+	c := &core{}
+	customer := types.NewJID("5511999999999", types.DefaultUserServer)
+	for _, rt := range []types.ReceiptType{types.ReceiptTypeDelivered, types.ReceiptTypeRead, types.ReceiptTypeSender, types.ReceiptTypeReadSelf} {
+		c.handleEvent(&events.Receipt{
+			MessageSource: types.MessageSource{Chat: customer, Sender: customer},
+			MessageIDs:    []types.MessageID{"A1", "A2"},
+			Timestamp:     time.Unix(1, 0),
+			Type:          rt,
+		})
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.inbound) != 2 {
+		t.Fatalf("fila com %d eventos, esperava delivered e read", len(c.inbound))
+	}
+	if e := c.inbound[0]; e.Type != "receipt" || e.Status != "delivered" || len(e.MessageIDs) != 2 || e.From != customer.String() {
+		t.Fatalf("delivered: %+v", e)
+	}
+	if e := c.inbound[1]; e.Status != "read" {
+		t.Fatalf("read: %+v", e)
+	}
+}

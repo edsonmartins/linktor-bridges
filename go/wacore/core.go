@@ -92,6 +92,10 @@ type InboundEvent struct {
 	Attachments []InboundAttachment `json:"attachments,omitempty"`
 	// Location vem com content_type "location"; não há arquivo a baixar.
 	Location *Location `json:"location,omitempty"`
+	// Recibo (Type "receipt"): Status delivered|read para cada MessageIDs,
+	// que são IDs de mensagens enviadas por este número.
+	Status     string   `json:"status,omitempty"`
+	MessageIDs []string `json:"message_ids,omitempty"`
 }
 
 // Location é um ponto compartilhado no WhatsApp (fixo ou ao vivo).
@@ -452,6 +456,23 @@ func (c *core) handleEvent(evt any) {
 		c.pairError = "pairing failed: " + v.Error.Error()
 		c.mu.Unlock()
 		return
+	case *events.Receipt:
+		// Só entregue e lido interessam ao Linktor; sender/retry/played-self são
+		// manutenção do protocolo. O Linktor casa os IDs com o que enviou e
+		// ignora o resto.
+		status := receiptStatus(v.Type)
+		if status == "" || len(v.MessageIDs) == 0 {
+			return
+		}
+		from, _ := c.resolveSender(v.Chat, v.RecipientAlt)
+		event = InboundEvent{
+			Type:       "receipt",
+			From:       from.String(),
+			Chat:       from.String(),
+			Status:     status,
+			MessageIDs: v.MessageIDs,
+			Timestamp:  v.Timestamp.Unix(),
+		}
 	case *events.LoggedOut:
 		event = InboundEvent{Type: "logout", Summary: "session revoked"}
 	case *events.Connected:
@@ -488,6 +509,19 @@ func (c *core) enqueueAfterDownload(event InboundEvent, media *mediaPart) {
 		log.Printf("wacore: mídia de %s sem download: %s", event.MessageID, event.Attachments[0].Error)
 	}
 	c.enqueue(event)
+}
+
+// receiptStatus traduz o tipo de recibo do WhatsApp para o status do Linktor;
+// vazio para os tipos que não mudam status.
+func receiptStatus(t types.ReceiptType) string {
+	switch t {
+	case types.ReceiptTypeDelivered:
+		return "delivered"
+	case types.ReceiptTypeRead, types.ReceiptTypePlayed:
+		return "read"
+	default:
+		return ""
+	}
 }
 
 func callEvent(kind CallEventKind, from types.JID, callID string, ts time.Time) InboundEvent {
