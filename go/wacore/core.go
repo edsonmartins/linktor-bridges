@@ -55,6 +55,12 @@ type core struct {
 	currentQR string
 
 	inbound []InboundEvent
+
+	// mediaDir recebe as mídias baixadas; download é trocável nos testes e
+	// downloads limita quantos rodam ao mesmo tempo.
+	mediaDir  string
+	download  downloader
+	downloads chan struct{}
 }
 
 // InboundEvent is a sanitized message received from WhatsApp, JSON-encoded for
@@ -71,6 +77,11 @@ type InboundEvent struct {
 	Text      string `json:"text,omitempty"`
 	Timestamp int64  `json:"ts,omitempty"`
 	Summary   string `json:"summary,omitempty"`
+	// ContentType é text ou o tipo da mídia; MsgType guarda a variante do
+	// WhatsApp (ptt, sticker). Attachments vem com Path no disco.
+	ContentType string              `json:"content_type,omitempty"`
+	MsgType     string              `json:"msg_type,omitempty"`
+	Attachments []InboundAttachment `json:"attachments,omitempty"`
 }
 
 // CallEventKind enumerates the call signaling events surfaced by the bridge.
@@ -255,6 +266,14 @@ func (c *core) initialize(dataDir string) error {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return fmt.Errorf("create store directory: %w", err)
 	}
+	mediaDir := filepath.Join(dataDir, mediaDirName)
+	if err := os.MkdirAll(mediaDir, 0o700); err != nil {
+		return fmt.Errorf("create media directory: %w", err)
+	}
+	c.mediaDir = mediaDir
+	if c.downloads == nil {
+		c.downloads = make(chan struct{}, maxConcurrentDownloads)
+	}
 	configureDeviceIdentity()
 
 	dbPath := filepath.Join(dataDir, "session.db")
@@ -329,13 +348,18 @@ func (c *core) handleEvent(evt any) {
 			return
 		}
 		// Texto simples chega como Conversation; com prévia de link, resposta
-		// citada ou em vários clientes atuais, como ExtendedTextMessage.
+		// citada ou em vários clientes atuais, como ExtendedTextMessage. Mídia
+		// traz a legenda no próprio proto.
 		text := v.Message.GetConversation()
 		if text == "" {
 			text = v.Message.GetExtendedTextMessage().GetText()
 		}
-		if text == "" {
-			log.Printf("wacore: mensagem sem texto ignorada (id=%s de %s)", v.Info.ID, v.Info.Sender.String())
+		media := extractMedia(v.Message)
+		if media != nil && text == "" {
+			text = media.caption
+		}
+		if text == "" && media == nil {
+			log.Printf("wacore: mensagem sem texto nem mídia ignorada (id=%s de %s)", v.Info.ID, v.Info.Sender.String())
 			return
 		}
 		// Remetente em LID: o Linktor identifica o contato pelo número, então
@@ -349,14 +373,24 @@ func (c *core) handleEvent(evt any) {
 		}
 		log.Printf("wacore: mensagem recebida (id=%s de %s lid=%s)", v.Info.ID, sender.String(), senderLID)
 		event = InboundEvent{
-			Type:       "message",
-			MessageID:  v.Info.ID,
-			From:       sender.String(),
-			SenderName: v.Info.PushName,
-			Chat:       chat.String(),
-			SenderLID:  senderLID,
-			Text:       text,
-			Timestamp:  v.Info.Timestamp.Unix(),
+			Type:        "message",
+			MessageID:   v.Info.ID,
+			From:        sender.String(),
+			SenderName:  v.Info.PushName,
+			Chat:        chat.String(),
+			SenderLID:   senderLID,
+			Text:        text,
+			Timestamp:   v.Info.Timestamp.Unix(),
+			ContentType: "text",
+		}
+		if media != nil {
+			event.ContentType = media.kind
+			event.MsgType = media.msgType
+			event.Attachments = []InboundAttachment{media.attachment(v.Info.ID)}
+			// O download bloqueia e não pode segurar a goroutine de eventos do
+			// whatsmeow; o evento entra na fila quando o arquivo estiver no disco.
+			go c.enqueueAfterDownload(event, media)
+			return
 		}
 	case *events.CallOffer:
 		event = callEvent(CallOffer, v.From, v.CallID, v.Timestamp)
@@ -389,12 +423,32 @@ func (c *core) handleEvent(evt any) {
 		return
 	}
 
+	c.enqueue(event)
+}
+
+// enqueue guarda o evento para DrainInbound, descartando os mais velhos se o
+// host não drena.
+func (c *core) enqueue(event InboundEvent) {
 	c.mu.Lock()
 	if len(c.inbound) >= 256 {
 		c.inbound = c.inbound[len(c.inbound)-128:]
 	}
 	c.inbound = append(c.inbound, event)
 	c.mu.Unlock()
+}
+
+// enqueueAfterDownload baixa a mídia (com limite de concorrência) e só então
+// enfileira o evento, com Path ou Error no anexo.
+func (c *core) enqueueAfterDownload(event InboundEvent, media *mediaPart) {
+	if c.downloads != nil {
+		c.downloads <- struct{}{}
+		defer func() { <-c.downloads }()
+	}
+	c.fetchMedia(event.MessageID, media, &event.Attachments[0])
+	if event.Attachments[0].Error != "" {
+		log.Printf("wacore: mídia de %s sem download: %s", event.MessageID, event.Attachments[0].Error)
+	}
+	c.enqueue(event)
 }
 
 func callEvent(kind CallEventKind, from types.JID, callID string, ts time.Time) InboundEvent {
@@ -612,29 +666,39 @@ func (c *core) sendText(destination, text, messageID string) (string, error) {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.client == nil {
-		return "", errors.New("core is not initialized")
+	if err := c.ensureReadyLocked(); err != nil {
+		return "", err
 	}
-	if !c.client.IsConnected() {
-		return "", errors.New("client is not connected")
-	}
-	if !c.client.WaitForConnection(readyTimeout) {
-		return "", errors.New("client is not connected and authenticated")
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), readyTimeout)
 	defer cancel()
-	message := &waProto.Message{Conversation: proto.String(text)}
-	var response whatsmeow.SendResponse
+	return c.sendMessageLocked(ctx, recipient, &waProto.Message{Conversation: proto.String(text)}, messageID)
+}
+
+// ensureReadyLocked confere que há sessão conectada e autenticada para enviar.
+func (c *core) ensureReadyLocked() error {
+	if c.client == nil {
+		return errors.New("core is not initialized")
+	}
+	if !c.client.IsConnected() {
+		return errors.New("client is not connected")
+	}
+	if !c.client.WaitForConnection(readyTimeout) {
+		return errors.New("client is not connected and authenticated")
+	}
+	return nil
+}
+
+// sendMessageLocked envia qualquer proto de mensagem; messageID vazio deixa o
+// whatsmeow gerar, ou reaproveita o ID dado para retry idempotente.
+func (c *core) sendMessageLocked(ctx context.Context, recipient types.JID, message *waProto.Message, messageID string) (string, error) {
+	var (
+		response whatsmeow.SendResponse
+		err      error
+	)
 	if messageID == "" {
 		response, err = c.client.SendMessage(ctx, recipient, message)
 	} else {
-		response, err = c.client.SendMessage(
-			ctx,
-			recipient,
-			message,
-			whatsmeow.SendRequestExtra{ID: types.MessageID(messageID)},
-		)
+		response, err = c.client.SendMessage(ctx, recipient, message, whatsmeow.SendRequestExtra{ID: types.MessageID(messageID)})
 	}
 	if err != nil {
 		return "", fmt.Errorf("send message: %w", err)

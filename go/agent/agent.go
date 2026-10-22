@@ -28,10 +28,23 @@ type Handler interface {
 	// SendText sends a text message and returns the WhatsApp message ID.
 	// messageID may be empty or a caller-persisted ID to reuse for idempotent retry.
 	SendText(to, text, messageID string) (string, error)
+	// SendMedia baixa a mídia da URL (já assinada pelo Linktor) e a envia com a
+	// legenda; devolve o ID da mensagem no WhatsApp.
+	SendMedia(to string, media OutboundMedia, caption, messageID string) (string, error)
 	// RejectCall rejects an incoming WhatsApp call (call signaling).
 	RejectCall(callFrom, callID string) error
 	// Status returns the current session snapshot as JSON (wacore.Status).
 	Status() (string, error)
+}
+
+// OutboundMedia é a mídia de um comando outbound: o Linktor manda a URL e o
+// host baixa, porque o frame não carrega bytes.
+type OutboundMedia struct {
+	Type     string `json:"type"` // image | video | audio | document
+	URL      string `json:"url"`
+	MimeType string `json:"mime_type,omitempty"`
+	Filename string `json:"filename,omitempty"`
+	PTT      bool   `json:"ptt,omitempty"`
 }
 
 // OutboundEvent is an event the bridge host wants forwarded to the gateway.
@@ -58,6 +71,12 @@ type Config struct {
 	// Outbound is a channel on which events (inbound messages, call signaling)
 	// are published so the host forwards them to the gateway.
 	Outbound chan OutboundEvent
+
+	// PrepareInbound, quando definido, ajusta o payload de um inbound na hora
+	// de enviar (o host usa para trocar caminhos de arquivo por base64) e
+	// devolve a limpeza a rodar depois da escrita. Assim só o frame em trânsito
+	// ocupa memória.
+	PrepareInbound func(payload []byte) (prepared []byte, cleanup func(), err error)
 }
 
 // Agent maintains the WebSocket connection to the Linktor gateway.
@@ -304,7 +323,15 @@ func (a *Agent) handleFrame(ctx context.Context, conn *Conn, data []byte) error 
 }
 
 func (a *Agent) execOutbound(f frame) frame {
-	messageID, err := a.server.SendText(f.To, f.Text, f.MessageID)
+	var (
+		messageID string
+		err       error
+	)
+	if f.Media != nil {
+		messageID, err = a.server.SendMedia(f.To, *f.Media, f.Text, f.MessageID)
+	} else {
+		messageID, err = a.server.SendText(f.To, f.Text, f.MessageID)
+	}
 	if err != nil {
 		return frame{
 			Type:          "ack",
@@ -356,7 +383,23 @@ func (a *Agent) serveEvents(ctx context.Context, conn *Conn) {
 			if evt.Kind == "call_event" {
 				frameType = "call_event"
 			}
-			_ = a.send(conn, frame{Type: frameType, ChannelID: a.cfg.ChannelID, Message: json.RawMessage(evt.Payload)})
+			payload := evt.Payload
+			var cleanup func()
+			if a.cfg.PrepareInbound != nil && frameType == "inbound" {
+				prepared, clean, err := a.cfg.PrepareInbound(payload)
+				if err != nil {
+					log.Printf("agent: inbound descartado: %v", err)
+					continue
+				}
+				payload, cleanup = prepared, clean
+			}
+			err := a.send(conn, frame{Type: frameType, ChannelID: a.cfg.ChannelID, Message: json.RawMessage(payload)})
+			if cleanup != nil {
+				cleanup()
+			}
+			if err != nil {
+				log.Printf("agent: falha ao enviar %s: %v", frameType, err)
+			}
 		}
 	}
 }
@@ -389,6 +432,7 @@ type frame struct {
 	Message       json.RawMessage `json:"message,omitempty"`
 	Status        json.RawMessage `json:"status,omitempty"`
 	TS            int64           `json:"ts,omitempty"`
+	Media         *OutboundMedia  `json:"media,omitempty"`
 }
 
 func sanitizeError(err error) string {

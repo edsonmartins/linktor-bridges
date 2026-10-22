@@ -83,6 +83,33 @@ Todos os frames são JSON. Envelope base:
 }
 ```
 
+Com mídia, `message` traz ainda `content_type` (`image`, `video`, `audio`,
+`document`), `msg_type` quando é variante do WhatsApp (`ptt` para mensagem de
+voz, `sticker` para figurinha) e `attachments[]`. `text` passa a ser a legenda.
+A bridge baixa e decifra a mídia no device e manda os bytes em base64; o
+Linktor os move para o object store antes de publicar (`rehostInboundMedia`).
+Acima de 32 MB, ou quando o download falha, o anexo segue sem `data` e com
+`error`, e a mensagem chega só com o registro.
+
+```json
+{
+  "type": "inbound",
+  "channel_id": "wh-abc123",
+  "message": {
+    "id": "3EB0....",
+    "from": "5511999999999@s.whatsapp.net",
+    "chat": "5511999999999@s.whatsapp.net",
+    "text": "legenda",
+    "content_type": "image",
+    "ts": 1724000000,
+    "attachments": [
+      { "type": "image", "mime_type": "image/jpeg", "filename": "3EB0.jpg",
+        "size_bytes": 83211, "data": "<base64>" }
+    ]
+  }
+}
+```
+
 **status** — mudança de estado da sessão:
 
 ```json
@@ -138,6 +165,23 @@ sensíveis). `correlation_id` ecoa o do `outbound`.
   "to": "5511999999999",
   "text": "mensagem",
   "message_id": "3EB0...."       // opcional; se presente, a bridge reusa (retry idempotente)
+}
+```
+
+Com `media`, o comando envia mídia e `text` vira a legenda. A URL já vem
+assinada pelo Linktor; a bridge faz `GET` nela (até 25 MB) e sobe o arquivo
+para o WhatsApp. `ptt` marca áudio como mensagem de voz (o WhatsApp espera
+OGG/Opus para isso).
+
+```json
+{
+  "type": "outbound",
+  "correlation_id": "c_124",
+  "channel_id": "wh-abc123",
+  "to": "5511999999999",
+  "text": "segue a foto",
+  "media": { "type": "image", "url": "https://linktor/api/v1/media/k.jpg?exp=..&sig=..",
+             "mime_type": "image/jpeg", "filename": "foto.jpg", "ptt": false }
 }
 ```
 

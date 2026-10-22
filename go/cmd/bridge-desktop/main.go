@@ -7,6 +7,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"flag"
@@ -18,6 +19,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"time"
+	"whatsbridge/agent"
+	"whatsbridge/media"
 
 	"github.com/skip2/go-qrcode"
 
@@ -71,7 +74,8 @@ func main() {
 	}
 
 	// Outbound handler used by the agent: sends via the local WhatsApp session.
-	outbound := outboundHandler{}
+	outbound := outboundHandler{mediaDir: wacore.MediaDir()}
+	wacore.PurgeMedia()
 
 	rt, err := newGatewayRuntime(dir, outbound)
 	if err != nil {
@@ -140,14 +144,34 @@ func shutdown() {
 	wacore.Disconnect()
 }
 
-// outboundHandler adapts wacore to agent.Handler.
-type outboundHandler struct{}
+// outboundHandler adapts wacore to agent.Handler. mediaDir recebe os
+// downloads temporários de mídia de saída.
+type outboundHandler struct {
+	mediaDir string
+}
 
 func (outboundHandler) SendText(to, text, messageID string) (string, error) {
 	if messageID == "" {
 		return wacore.SendText(to, text)
 	}
 	return wacore.SendTextWithID(to, text, messageID)
+}
+
+// SendMedia baixa a URL assinada do Linktor para um arquivo temporário, envia
+// pelo wacore e apaga o arquivo.
+func (h outboundHandler) SendMedia(to string, m agent.OutboundMedia, caption, messageID string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	path, fetchedMime, err := media.Fetch(ctx, m.URL, h.mediaDir)
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(path)
+	mimeType := m.MimeType
+	if mimeType == "" {
+		mimeType = fetchedMime
+	}
+	return wacore.SendMedia(to, m.Type, path, mimeType, m.Filename, caption, m.PTT, messageID)
 }
 
 func (outboundHandler) RejectCall(callFrom, callID string) error {

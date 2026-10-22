@@ -199,13 +199,15 @@ go build ./cmd/bridge-desktop
 
 ### Roadmap
 
-- [ ] **Mídia**: imagem/documento/vídeo/áudio outbound e inbound pelo protocolo
-  (hoje texto-only; media retorna erro permanente explícito)
+- [x] **Mídia**: imagem/vídeo/áudio/documento nos dois sentidos (`media` no
+  `outbound`, `attachments[]` no `inbound`; figurinha chega como imagem e voz
+  como áudio `ptt`). Inbound é baixado no device e re-hospedado no store do
+  Linktor; acima de 32 MB só o registro segue
+- [x] **Registrar canal + token no Linktor**: canal "WhatsApp via Bridge" no
+  admin, com token e saúde do bridge
+- [ ] **Mensagem de voz a partir de outros formatos**: transcodificar para
+  OGG/Opus antes de enviar (hoje áudio de outro formato sai como arquivo)
 - [ ] **Interativos**: botões/listas native-flow sobre a bridge
-- [ ] **Registrar usuário + canal**: UX no Linktor para criar canal bridge e
-  gerar token (ex.: flag `whatsapp_remote` ou campo `transport: bridge`)
-- [ ] **Mídia inbound com rehost**: baixar/decifrar no device e subir no store
-  do Linktor (`rehostInboundMedia`)
 - [ ] **Voz com mídia**: streaming PCM 16k bridge↔Linktor (engine na bridge)
 - [ ] **Teste E2E ao vivo**: parear device real → enviar por
   `POST /api/v1/conversations/:id/messages` → confirmar no Inbox

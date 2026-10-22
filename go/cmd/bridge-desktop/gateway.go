@@ -15,6 +15,7 @@ import (
 
 	"whatsbridge/agent"
 	"whatsbridge/eventstore"
+	"whatsbridge/media"
 	"whatsbridge/wacore"
 )
 
@@ -128,6 +129,8 @@ func (rt *gatewayRuntime) start(cfg Config) error {
 		Platform:  "desktop",
 		Version:   "0.1.0",
 		Outbound:  rt.events,
+		// Anexos saem do disco para o frame só na hora de enviar.
+		PrepareInbound: media.InlineAttachments,
 	}, rt.handler)
 	ctx, cancel := context.WithCancel(context.Background())
 	rt.agent = a

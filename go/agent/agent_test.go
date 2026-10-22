@@ -128,6 +128,14 @@ func (h *mockHandler) SendText(to, text, messageID string) (string, error) {
 	return "MOCKID", nil
 }
 
+func (h *mockHandler) SendMedia(to string, m OutboundMedia, caption, messageID string) (string, error) {
+	h.sent <- sendCall{to, caption + " [" + m.Type + ":" + m.URL + "]", messageID}
+	if h.sendErr != nil {
+		return "", h.sendErr
+	}
+	return "MOCKMEDIA", nil
+}
+
 func (h *mockHandler) RejectCall(callFrom, callID string) error {
 	if h.rejected != nil {
 		h.rejected <- rejectCall{callFrom, callID}
@@ -322,5 +330,75 @@ func TestRejectsBadAuth(t *testing.T) {
 		t.Fatal("agent exited early on auth failure (should backoff-retry)")
 	case <-time.After(2 * time.Second):
 		// expected: still retrying
+	}
+}
+
+// Um outbound com media vai para SendMedia, com a legenda em text, e o ack
+// devolve o ID da mídia enviada.
+func TestOutboundMediaAck(t *testing.T) {
+	server := newMockServer(t, nil)
+	handler := &mockHandler{sent: make(chan sendCall, 1)}
+	agent := New(Config{ServerURL: server.url, ChannelID: "ch-1", Token: "tok"}, handler)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	go agent.Run(ctx)
+
+	server.outboundCh <- frame{
+		Type: "outbound", CorrelationID: "c_m", To: "5511999999999", Text: "legenda",
+		Media: &OutboundMedia{Type: "image", URL: "https://linktor.test/api/v1/media/x.jpg?sig=1", MimeType: "image/jpeg", Filename: "x.jpg"},
+	}
+	select {
+	case ack := <-server.acks:
+		if ack.CorrelationID != "c_m" || !ack.OK || ack.MessageID != "MOCKMEDIA" {
+			t.Fatalf("unexpected ack: %+v", ack)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for ack")
+	}
+	select {
+	case call := <-handler.sent:
+		if call.to != "5511999999999" || call.text != "legenda [image:https://linktor.test/api/v1/media/x.jpg?sig=1]" {
+			t.Fatalf("unexpected SendMedia call: %+v", call)
+		}
+	default:
+		t.Fatal("SendMedia was not called")
+	}
+}
+
+// PrepareInbound roda na hora de enviar e a limpeza roda depois da escrita.
+func TestPrepareInboundRunsBeforeSend(t *testing.T) {
+	var got frame
+	received := make(chan struct{}, 1)
+	server := newMockServer(t, func(f frame) {
+		if f.Type == "inbound" {
+			got = f
+			received <- struct{}{}
+		}
+	})
+	cleaned := make(chan struct{}, 1)
+	events := make(chan OutboundEvent, 1)
+	agent := New(Config{
+		ServerURL: server.url, ChannelID: "ch-1", Token: "tok", Outbound: events,
+		PrepareInbound: func(payload []byte) ([]byte, func(), error) {
+			return []byte(`{"id":"M1","text":"preparado"}`), func() { cleaned <- struct{}{} }, nil
+		},
+	}, &mockHandler{sent: make(chan sendCall, 1)})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	go agent.Run(ctx)
+
+	events <- OutboundEvent{Kind: "inbound", Payload: []byte(`{"id":"M1","attachments":[{"path":"/x"}]}`)}
+	select {
+	case <-received:
+		if string(got.Message) != `{"id":"M1","text":"preparado"}` {
+			t.Fatalf("inbound não foi preparado: %s", got.Message)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for inbound")
+	}
+	select {
+	case <-cleaned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanup não rodou após o envio")
 	}
 }
