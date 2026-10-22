@@ -140,6 +140,13 @@ type Conn struct {
 	done chan struct{}
 }
 
+// maxReconnectBackoff limita a espera entre tentativas de reconexão. O caso
+// comum é o Linktor reiniciando por alguns segundos; com teto alto o bridge
+// ficava até 30s parado depois de o servidor voltar, e as mensagens do
+// atendente esperavam junto. Tentar a cada 5s contra um servidor fora do ar
+// não custa nada.
+const maxReconnectBackoff = 5 * time.Second
+
 // Run connects (with backoff) and serves the protocol until ctx is cancelled.
 // It is blocking; call it in its own goroutine.
 func (a *Agent) Run(ctx context.Context) {
@@ -164,10 +171,10 @@ func (a *Agent) Run(ctx context.Context) {
 			return
 		case <-time.After(backoff):
 		}
-		if backoff < 30*time.Second {
+		if backoff < maxReconnectBackoff {
 			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
+			if backoff > maxReconnectBackoff {
+				backoff = maxReconnectBackoff
 			}
 		}
 	}
