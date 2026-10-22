@@ -61,6 +61,10 @@ type core struct {
 	mediaDir  string
 	download  downloader
 	downloads chan struct{}
+
+	// sent lembra o que este bridge enviou, para separar eco de mensagem
+	// digitada no aparelho pareado.
+	sent *sentRegistry
 }
 
 // InboundEvent is a sanitized message received from WhatsApp, JSON-encoded for
@@ -74,9 +78,13 @@ type InboundEvent struct {
 	// SenderLID é o endereço LID do remetente quando o WhatsApp o usou no
 	// lugar do número; From traz o número (PN) sempre que for conhecido.
 	SenderLID string `json:"sender_lid,omitempty"`
-	Text      string `json:"text,omitempty"`
-	Timestamp int64  `json:"ts,omitempty"`
-	Summary   string `json:"summary,omitempty"`
+	// IsFromMe marca mensagem digitada no aparelho pareado: From passa a ser
+	// o cliente (o chat) e OperatorName o nome de quem digitou.
+	IsFromMe     bool   `json:"is_from_me,omitempty"`
+	OperatorName string `json:"operator_name,omitempty"`
+	Text         string `json:"text,omitempty"`
+	Timestamp    int64  `json:"ts,omitempty"`
+	Summary      string `json:"summary,omitempty"`
 	// ContentType é text ou o tipo da mídia; MsgType guarda a variante do
 	// WhatsApp (ptt, sticker). Attachments vem com Path no disco.
 	ContentType string              `json:"content_type,omitempty"`
@@ -342,9 +350,10 @@ func (c *core) handleEvent(evt any) {
 	var event InboundEvent
 	switch v := evt.(type) {
 	case *events.Message:
-		// Mensagens enviadas pelo próprio celular pareado não são "recebidas":
-		// voltariam ao Linktor como se fossem do cliente.
-		if v.Info.IsFromMe {
+		// IsFromMe sozinho não é eco: é também o que o atendente digita no
+		// aparelho pareado, metade de cada conversa. Eco é só o ID que nós
+		// mesmos distribuímos ao enviar.
+		if v.Info.IsFromMe && c.sent.isOurs(v.Info.ID, time.Now()) {
 			return
 		}
 		// Texto simples chega como Conversation; com prévia de link, resposta
@@ -371,17 +380,29 @@ func (c *core) handleEvent(evt any) {
 		if chat.Server == types.HiddenUserServer && chat.User == v.Info.Sender.User {
 			chat = sender
 		}
-		log.Printf("wacore: mensagem recebida (id=%s de %s lid=%s)", v.Info.ID, sender.String(), senderLID)
+		senderName := v.Info.PushName
+		operatorName := ""
+		if v.Info.IsFromMe {
+			// Mensagem do próprio número: quem identifica a conversa é o
+			// cliente, que está no chat; o nome vai para operator_name para não
+			// renomear o contato com o nome do atendente.
+			sender, senderLID = c.resolveSender(v.Info.Chat, v.Info.RecipientAlt)
+			chat = sender
+			operatorName, senderName = senderName, ""
+		}
+		log.Printf("wacore: mensagem recebida (id=%s de %s lid=%s from_me=%t)", v.Info.ID, sender.String(), senderLID, v.Info.IsFromMe)
 		event = InboundEvent{
-			Type:        "message",
-			MessageID:   v.Info.ID,
-			From:        sender.String(),
-			SenderName:  v.Info.PushName,
-			Chat:        chat.String(),
-			SenderLID:   senderLID,
-			Text:        text,
-			Timestamp:   v.Info.Timestamp.Unix(),
-			ContentType: "text",
+			Type:         "message",
+			MessageID:    v.Info.ID,
+			From:         sender.String(),
+			SenderName:   senderName,
+			Chat:         chat.String(),
+			SenderLID:    senderLID,
+			IsFromMe:     v.Info.IsFromMe,
+			OperatorName: operatorName,
+			Text:         text,
+			Timestamp:    v.Info.Timestamp.Unix(),
+			ContentType:  "text",
 		}
 		if media != nil {
 			event.ContentType = media.kind
@@ -703,6 +724,12 @@ func (c *core) sendMessageLocked(ctx context.Context, recipient types.JID, messa
 	if err != nil {
 		return "", fmt.Errorf("send message: %w", err)
 	}
+	// Lembrado antes de devolver: o eco pode chegar enquanto o chamador ainda
+	// trata o resultado, e eco não lembrado vira mensagem duplicada.
+	if c.sent == nil {
+		c.sent = newSentRegistry()
+	}
+	c.sent.remember(response.ID, time.Now())
 	return response.ID, nil
 }
 

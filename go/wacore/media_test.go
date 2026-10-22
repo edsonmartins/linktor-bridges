@@ -136,3 +136,36 @@ func TestSendMediaWithoutSession(t *testing.T) {
 		t.Fatal("arquivo inexistente deve falhar")
 	}
 }
+
+// Mensagem digitada no aparelho pareado segue com is_from_me, arquivada no
+// cliente (chat) e sem renomear o contato; eco do que o bridge enviou cai fora.
+func TestFromMeForwardedEchoDropped(t *testing.T) {
+	c := &core{sent: newSentRegistry()}
+	customer := types.NewJID("5511999999999", types.DefaultUserServer)
+	me := types.NewJID("554497239232", types.DefaultUserServer)
+	typed := func(id string) *events.Message {
+		return &events.Message{
+			Message: &waProto.Message{Conversation: proto.String("respondi pelo app")},
+			Info: types.MessageInfo{
+				ID: id, Timestamp: time.Unix(1, 0), PushName: "Loja",
+				MessageSource: types.MessageSource{Sender: me, Chat: customer, IsFromMe: true},
+			},
+		}
+	}
+	c.sent.remember("ECHO1", time.Now())
+	c.handleEvent(typed("ECHO1"))
+	c.handleEvent(typed("TYPED1"))
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.inbound) != 1 {
+		t.Fatalf("fila com %d eventos, esperava só a digitada", len(c.inbound))
+	}
+	e := c.inbound[0]
+	if e.MessageID != "TYPED1" || !e.IsFromMe || e.From != customer.String() || e.Chat != customer.String() {
+		t.Fatalf("evento: %+v", e)
+	}
+	if e.SenderName != "" || e.OperatorName != "Loja" {
+		t.Fatalf("nome do atendente não pode virar nome do contato: %+v", e)
+	}
+}
