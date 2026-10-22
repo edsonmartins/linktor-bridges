@@ -169,3 +169,34 @@ func TestFromMeForwardedEchoDropped(t *testing.T) {
 		t.Fatalf("nome do atendente não pode virar nome do contato: %+v", e)
 	}
 }
+
+// Localização entra como content_type location, com o nome no texto e as
+// coordenadas no evento; ao vivo usa a legenda como nome.
+func TestLocationForwarded(t *testing.T) {
+	c := &core{}
+	from := types.NewJID("5511999999999", types.DefaultUserServer)
+	c.handleEvent(&events.Message{
+		Message: &waProto.Message{LocationMessage: &waProto.LocationMessage{
+			DegreesLatitude: proto.Float64(-23.55), DegreesLongitude: proto.Float64(-46.63), Name: proto.String("Loja"), Address: proto.String("Av. Paulista, 1"),
+		}},
+		Info: types.MessageInfo{ID: "LOC1", Timestamp: time.Unix(1, 0), MessageSource: types.MessageSource{Sender: from, Chat: from}},
+	})
+	c.handleEvent(&events.Message{
+		Message: &waProto.Message{LiveLocationMessage: &waProto.LiveLocationMessage{
+			DegreesLatitude: proto.Float64(-1), DegreesLongitude: proto.Float64(-2), Caption: proto.String("a caminho"),
+		}},
+		Info: types.MessageInfo{ID: "LOC2", Timestamp: time.Unix(1, 0), MessageSource: types.MessageSource{Sender: from, Chat: from}},
+	})
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.inbound) != 2 {
+		t.Fatalf("fila com %d eventos, esperava 2", len(c.inbound))
+	}
+	fixed, live := c.inbound[0], c.inbound[1]
+	if fixed.ContentType != "location" || fixed.Text != "Loja" || fixed.Location == nil || fixed.Location.Latitude != -23.55 || fixed.Location.Address != "Av. Paulista, 1" {
+		t.Fatalf("fixa: %+v %+v", fixed, fixed.Location)
+	}
+	if live.Text != "a caminho" || live.Location == nil || live.Location.Longitude != -2 {
+		t.Fatalf("ao vivo: %+v %+v", live, live.Location)
+	}
+}

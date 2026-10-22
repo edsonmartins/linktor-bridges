@@ -90,6 +90,16 @@ type InboundEvent struct {
 	ContentType string              `json:"content_type,omitempty"`
 	MsgType     string              `json:"msg_type,omitempty"`
 	Attachments []InboundAttachment `json:"attachments,omitempty"`
+	// Location vem com content_type "location"; não há arquivo a baixar.
+	Location *Location `json:"location,omitempty"`
+}
+
+// Location é um ponto compartilhado no WhatsApp (fixo ou ao vivo).
+type Location struct {
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+	Name      string  `json:"name,omitempty"`
+	Address   string  `json:"address,omitempty"`
 }
 
 // CallEventKind enumerates the call signaling events surfaced by the bridge.
@@ -367,7 +377,11 @@ func (c *core) handleEvent(evt any) {
 		if media != nil && text == "" {
 			text = media.caption
 		}
-		if text == "" && media == nil {
+		location := extractLocation(v.Message)
+		if location != nil && text == "" {
+			text = location.Name
+		}
+		if text == "" && media == nil && location == nil {
 			log.Printf("wacore: mensagem sem texto nem mídia ignorada (id=%s de %s)", v.Info.ID, v.Info.Sender.String())
 			return
 		}
@@ -403,6 +417,10 @@ func (c *core) handleEvent(evt any) {
 			Text:         text,
 			Timestamp:    v.Info.Timestamp.Unix(),
 			ContentType:  "text",
+		}
+		if location != nil {
+			event.ContentType = "location"
+			event.Location = location
 		}
 		if media != nil {
 			event.ContentType = media.kind

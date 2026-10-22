@@ -85,6 +85,18 @@ func extractMedia(m *waProto.Message) *mediaPart {
 	return nil
 }
 
+// extractLocation lê uma localização fixa ou ao vivo, ou nil. O nome vira o
+// texto da mensagem e o endereço vai à parte, como no adaptador embutido.
+func extractLocation(m *waProto.Message) *Location {
+	if loc := m.GetLocationMessage(); loc != nil {
+		return &Location{Latitude: loc.GetDegreesLatitude(), Longitude: loc.GetDegreesLongitude(), Name: loc.GetName(), Address: loc.GetAddress()}
+	}
+	if live := m.GetLiveLocationMessage(); live != nil {
+		return &Location{Latitude: live.GetDegreesLatitude(), Longitude: live.GetDegreesLongitude(), Name: live.GetCaption()}
+	}
+	return nil
+}
+
 // attachment monta o registro do anexo antes do download.
 func (p *mediaPart) attachment(messageID string) InboundAttachment {
 	filename := p.filename
