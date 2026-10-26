@@ -130,6 +130,36 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o bin/bridge-windows-amd64.exe
 GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -o bin/bridge-linux-amd64 ./cmd/bridge-desktop
 ```
 
+### Configuração (painel ou flags)
+
+Na primeira execução o bridge sobe sem ligação com o Linktor e o painel pede
+três campos no bloco **Linktor**: a URL do gateway (`wss://host/api/v1/gateways/ws`),
+o ID do canal `whatsapp_remote` e o token gerado em
+`POST /api/v1/channels/:id/bridge-token`. Ao salvar, ele grava
+`~/.linktor/linktor-bridge/config.json` (permissão `0600`) e liga na hora; nas
+execuções seguintes lê o arquivo e liga sozinho. Os flags `--server`,
+`--channel-id` e `--token` continuam valendo, sobrepõem o arquivo e também são
+gravados nele.
+
+O painel escuta em `127.0.0.1:7788` por padrão (`--listen` ou `"listen"` no
+`config.json` trocam; se a porta estiver ocupada ele avisa e usa uma livre). O
+bloco Linktor mostra se o bridge está de fato conectado ao gateway, separado
+do estado do WhatsApp. **Desconectar e esquecer** apaga a ligação com o Linktor
+sem desparear o WhatsApp.
+
+### Sem bandeja (Linux sem GTK/cgo, servidores, CI)
+
+```bash
+CGO_ENABLED=0 go build -tags notray -o linktor-bridge ./cmd/bridge-desktop
+./linktor-bridge            # painel em http://127.0.0.1:7788; configure o Linktor por lá
+```
+
+Com `-tags notray` a bandeja fica de fora e o binário é 100% Go: o painel
+continua em `127.0.0.1:<porta>` (a URL sai no terminal), o monitor de status
+loga as mudanças e Ctrl+C encerra. Notificações nativas seguem funcionando onde
+houver `notify-send`/D-Bus.
+
+
 > A bandeja usa `getlantern/systray` (AppKit no macOS, X11 no Linux, nativo no
 > Windows), por isso só o Windows tem build 100% pure-Go. O restante do binário
 > (whatsmeow, sqlite modernc) é pure-Go — o cgo é apenas da bandeja.
@@ -169,13 +199,15 @@ go build ./cmd/bridge-desktop
 
 ### Roadmap
 
-- [ ] **Mídia**: imagem/documento/vídeo/áudio outbound e inbound pelo protocolo
-  (hoje texto-only; media retorna erro permanente explícito)
+- [x] **Mídia**: imagem/vídeo/áudio/documento nos dois sentidos (`media` no
+  `outbound`, `attachments[]` no `inbound`; figurinha chega como imagem e voz
+  como áudio `ptt`). Inbound é baixado no device e re-hospedado no store do
+  Linktor; acima de 32 MB só o registro segue
+- [x] **Registrar canal + token no Linktor**: canal "WhatsApp via Bridge" no
+  admin, com token e saúde do bridge
+- [ ] **Mensagem de voz a partir de outros formatos**: transcodificar para
+  OGG/Opus antes de enviar (hoje áudio de outro formato sai como arquivo)
 - [ ] **Interativos**: botões/listas native-flow sobre a bridge
-- [ ] **Registrar usuário + canal**: UX no Linktor para criar canal bridge e
-  gerar token (ex.: flag `whatsapp_remote` ou campo `transport: bridge`)
-- [ ] **Mídia inbound com rehost**: baixar/decifrar no device e subir no store
-  do Linktor (`rehostInboundMedia`)
 - [ ] **Voz com mídia**: streaming PCM 16k bridge↔Linktor (engine na bridge)
 - [ ] **Teste E2E ao vivo**: parear device real → enviar por
   `POST /api/v1/conversations/:id/messages` → confirmar no Inbox

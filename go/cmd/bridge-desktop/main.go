@@ -12,9 +12,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"image"
-	"image/color"
-	"image/png"
 	"net"
 	"net/http"
 	"os"
@@ -22,12 +19,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"time"
+	"whatsbridge/agent"
+	"whatsbridge/media"
 
-	"github.com/getlantern/systray"
 	"github.com/skip2/go-qrcode"
 
-	"whatsbridge/agent"
-	"whatsbridge/eventstore"
 	"whatsbridge/wacore"
 )
 
@@ -35,19 +31,19 @@ import (
 var webUI embed.FS
 
 var (
-	gatewayServer  = flag.String("server", "", "Linktor gateway WS URL (ws(s)://host/api/v1/gateways/ws)")
-	gatewayChannel = flag.String("channel-id", "", "Linktor channel ID")
-	gatewayToken   = flag.String("token", "", "Linktor bridge token")
+	gatewayServer  = flag.String("server", "", "Linktor gateway WS URL (ws(s)://host/api/v1/gateways/ws); grava em config.json")
+	gatewayChannel = flag.String("channel-id", "", "Linktor channel ID; grava em config.json")
+	gatewayToken   = flag.String("token", "", "Linktor bridge token; grava em config.json")
+	listenAddr     = flag.String("listen", "", "endereço do painel local (padrão 127.0.0.1:7788, ou o de config.json)")
 )
+
+// defaultListen é fixo de propósito: a URL do painel não pode mudar a cada
+// execução. Se a porta estiver ocupada, cai para uma aleatória e avisa.
+const defaultListen = "127.0.0.1:7788"
 
 const dataDirName = "linktor-bridge"
 
-var lastQR struct {
-	payload string
-	at      time.Time
-}
-
-var agentCancel context.CancelFunc
+var gateway *gatewayRuntime
 
 func main() {
 	flag.Parse()
@@ -66,19 +62,65 @@ func main() {
 	}
 	defer wacore.Close()
 
-	// Outbound handler used by the agent: sends via the local WhatsApp session.
-	outbound := outboundHandler{}
-
-	if *gatewayServer != "" {
-		if *gatewayChannel == "" || *gatewayToken == "" {
-			fatal("--channel-id and --token are required when using --server")
-		}
-		startAgent(*gatewayServer, *gatewayChannel, *gatewayToken, outbound)
+	// Sessão já pareada em execução anterior: reconecta sozinha na subida, sem
+	// esperar um clique no painel. Falha aqui não é fatal (o painel permite
+	// tentar de novo) e o auto-reconnect do whatsmeow cuida das quedas.
+	if wacore.IsPaired() {
+		go func() {
+			if err := wacore.Connect(); err != nil {
+				fmt.Printf("connect on startup: %v\n", err)
+			}
+		}()
 	}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// Outbound handler used by the agent: sends via the local WhatsApp session.
+	outbound := outboundHandler{mediaDir: wacore.MediaDir()}
+	wacore.PurgeMedia()
+
+	rt, err := newGatewayRuntime(dir, outbound)
 	if err != nil {
-		fatal("listen: %v", err)
+		fatal("%v", err)
+	}
+	gateway = rt
+
+	// Configuração do Linktor: config.json, com os flags por cima (e gravados).
+	cfg, err := loadConfig(dir)
+	if err != nil {
+		fatal("%v", err)
+	}
+	if *gatewayServer != "" {
+		cfg.Server = *gatewayServer
+	}
+	if *gatewayChannel != "" {
+		cfg.ChannelID = *gatewayChannel
+	}
+	if *gatewayToken != "" {
+		cfg.Token = *gatewayToken
+	}
+	if *listenAddr != "" {
+		cfg.Listen = *listenAddr
+	}
+	rt.cfg.Listen = cfg.Listen
+	if cfg.Server != "" || cfg.ChannelID != "" || cfg.Token != "" {
+		if err := rt.start(cfg); err != nil {
+			// Sem ligação com o Linktor o painel ainda serve para configurar.
+			fmt.Printf("gateway não ligado: %v (configure no painel)\n", err)
+		}
+	} else {
+		fmt.Println("gateway não configurado: informe servidor, canal e token no painel")
+	}
+
+	listen := cfg.Listen
+	if listen == "" {
+		listen = defaultListen
+	}
+	ln, err := net.Listen("tcp", listen)
+	if err != nil {
+		fmt.Printf("porta %s ocupada (%v); usando uma porta livre\n", listen, err)
+		ln, err = net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			fatal("listen: %v", err)
+		}
 	}
 	addr := fmt.Sprintf("http://%s", ln.Addr().String())
 
@@ -91,14 +133,22 @@ func main() {
 
 	fmt.Printf("dashboard: %s\n", addr)
 
-	systray.Run(
-		func() { onReady(addr) },
-		func() {},
-	)
+	runUI(addr)
 }
 
-// outboundHandler adapts wacore to agent.Handler.
-type outboundHandler struct{}
+// shutdown para o agente e desconecta a sessão do WhatsApp (sem desparear).
+func shutdown() {
+	if gateway != nil {
+		gateway.stop()
+	}
+	wacore.Disconnect()
+}
+
+// outboundHandler adapts wacore to agent.Handler. mediaDir recebe os
+// downloads temporários de mídia de saída.
+type outboundHandler struct {
+	mediaDir string
+}
 
 func (outboundHandler) SendText(to, text, messageID string) (string, error) {
 	if messageID == "" {
@@ -107,142 +157,29 @@ func (outboundHandler) SendText(to, text, messageID string) (string, error) {
 	return wacore.SendTextWithID(to, text, messageID)
 }
 
+// SendMedia baixa a URL assinada do Linktor para um arquivo temporário, envia
+// pelo wacore e apaga o arquivo.
+func (h outboundHandler) SendMedia(to string, m agent.OutboundMedia, caption, messageID string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	path, fetchedMime, err := media.Fetch(ctx, m.URL, h.mediaDir)
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(path)
+	mimeType := m.MimeType
+	if mimeType == "" {
+		mimeType = fetchedMime
+	}
+	return wacore.SendMedia(to, m.Type, path, mimeType, m.Filename, caption, m.PTT, messageID)
+}
+
 func (outboundHandler) RejectCall(callFrom, callID string) error {
 	return wacore.RejectCall(callFrom, callID)
 }
 
 func (outboundHandler) Status() (string, error) {
 	return wacore.GetStatus()
-}
-
-// startAgent runs the Linktor bridge agent in the background. Inbound events
-// drained from wacore are persisted to the local event store and forwarded to
-// the gateway as it connects (durable, so an outage does not lose events).
-func startAgent(serverURL, channelID, token string, outbound outboundHandler) *agent.Agent {
-	events := make(chan agent.OutboundEvent, 256)
-
-	// Durable event store: events remain queued until the gateway confirms.
-	storeDir := filepath.Join(mustDataDir(), "events.db")
-	store, err := eventstore.Open(storeDir)
-	if err != nil {
-		fatal("open event store: %v", err)
-	}
-
-	a := agent.New(agent.Config{
-		ServerURL: serverURL,
-		ChannelID: channelID,
-		Token:     token,
-		Platform:  "desktop",
-		Version:   "0.1.0",
-		Outbound:  events,
-	}, outbound)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go a.Run(ctx)
-	agentCancel = cancel
-
-	// Periodic heartbeat: persist drained inbound events, then replay the store
-	// to the connected agent and refresh status. Call signaling events ride a
-	// separate kind so the gateway routes them to the call handler.
-	go func() {
-		ticker := time.NewTicker(3 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			raw, err := wacore.DrainInbound()
-			if err == nil {
-				var events []wacore.InboundEvent
-				if json.Unmarshal([]byte(raw), &events) == nil {
-					for _, evt := range events {
-						data, err := json.Marshal(evt)
-						if err != nil {
-							continue
-						}
-						kind := "inbound"
-						if evt.Type == "call" {
-							kind = "call_event"
-						}
-						if err := store.Enqueue(kind, data); err != nil {
-							fmt.Printf("eventstore: enqueue failed: %v\n", err)
-						}
-					}
-				}
-			}
-			pending, err := store.Pending(256)
-			if err == nil && len(pending) > 0 {
-				maxSeq := pending[len(pending)-1].Seq
-				flushed := true
-				for _, item := range pending {
-					select {
-					case events <- agent.OutboundEvent{Kind: item.Kind, Payload: item.Payload}:
-					default:
-						flushed = false // gateway buffer full; retry later, keep queued
-					}
-				}
-				if flushed {
-					if err := store.Acknowledge(maxSeq); err != nil {
-						fmt.Printf("eventstore: acknowledge failed: %v\n", err)
-					}
-				}
-			}
-			if status, err := wacore.GetStatus(); err == nil {
-				a.SetStatus([]byte(status))
-			}
-		}
-	}()
-
-	fmt.Printf("gateway: %s (channel %s) · event store: %s\n", serverURL, channelID, storeDir)
-	return a
-}
-
-func mustDataDir() string {
-	dir, err := defaultDataDir()
-	if err != nil {
-		fatal("resolve data dir: %v", err)
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		fatal("create data dir: %v", err)
-	}
-	return dir
-}
-
-func onReady(dashboard string) {
-	systray.SetTitle("Linktor Bridge")
-	systray.SetTooltip("Linktor WhatsApp Bridge")
-	systray.SetIcon(trayIcon())
-
-	mOpen := systray.AddMenuItem("Abrir painel", "Abrir o dashboard local")
-	mPair := systray.AddMenuItem("Conectar WhatsApp", "Iniciar pareamento QR")
-	mQuit := systray.AddMenuItem("Sair", "Encerrar a bridge")
-
-	// Track connection state: tray tooltip + native OS notification when the
-	// bridge drops and stays disconnected (or the session is revoked).
-	quitStatus := make(chan struct{})
-	defer close(quitStatus)
-	go new(statusMonitor).run(quitStatus)
-
-	go func() {
-		for {
-			select {
-			case <-mOpen.ClickedCh:
-				openBrowser(dashboard)
-			case <-mPair.ClickedCh:
-				qr, err := wacore.BeginPairing()
-				if err != nil {
-					fmt.Printf("pairing not started: %v\n", err)
-					continue
-				}
-				lastQR.payload, lastQR.at = qr, time.Now()
-				fmt.Printf("pairing QR ready: %s\n", dashboard)
-			case <-mQuit.ClickedCh:
-				if agentCancel != nil {
-					agentCancel()
-				}
-				wacore.Disconnect()
-				systray.Quit()
-				return
-			}
-		}
-	}()
 }
 
 func newRouter(outbound outboundHandler) http.Handler {
@@ -256,15 +193,24 @@ func newRouter(outbound outboundHandler) http.Handler {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write(index)
 	})
+	for _, pattern := range []string{"GET /api/gateway", "POST /api/gateway", "DELETE /api/gateway"} {
+		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+			gateway.handleGateway(w, r)
+		})
+	}
 	mux.HandleFunc("GET /api/status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, mustStatus())
 	})
 	mux.HandleFunc("GET /api/qr.png", func(w http.ResponseWriter, r *http.Request) {
-		if lastQR.payload == "" {
+		// Sempre o código atual: o WhatsApp troca o QR a cada ~20s enquanto o
+		// pareamento está aberto, e o painel recarrega a imagem a cada 4s.
+		payload := wacore.CurrentQR()
+		if payload == "" {
 			http.Error(w, "no active QR", http.StatusNotFound)
 			return
 		}
-		pngBytes, err := qrcode.Encode(lastQR.payload, qrcode.Medium, 256)
+		w.Header().Set("Cache-Control", "no-store")
+		pngBytes, err := qrcode.Encode(payload, qrcode.Medium, 256)
 		if err != nil {
 			http.Error(w, "encode QR: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -273,13 +219,11 @@ func newRouter(outbound outboundHandler) http.Handler {
 		_, _ = w.Write(pngBytes)
 	})
 	mux.HandleFunc("POST /api/pair/qr", func(w http.ResponseWriter, r *http.Request) {
-		qr, err := wacore.BeginPairing()
-		if err != nil {
+		if _, err := wacore.BeginPairing(); err != nil {
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}
-		lastQR.payload, lastQR.at = qr, time.Now()
-		writeJSON(w, map[string]any{"qr": true, "expires_at": lastQR.at.Add(3 * time.Minute).Unix()})
+		writeJSON(w, map[string]any{"qr": true, "expires_at": time.Now().Add(3 * time.Minute).Unix()})
 	})
 	mux.HandleFunc("POST /api/pair/code", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -346,7 +290,11 @@ func mustStatus() map[string]any {
 	}
 	var parsed map[string]any
 	_ = json.Unmarshal([]byte(status), &parsed)
-	parsed["qr_active"] = lastQR.payload != ""
+	parsed["qr_active"] = wacore.CurrentQR() != ""
+	if pairErr := wacore.PairingError(); pairErr != "" {
+		parsed["pair_error"] = pairErr
+		parsed["last_error"] = pairErr
+	}
 	return parsed
 }
 
@@ -361,36 +309,6 @@ func defaultDataDir() (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, ".linktor", dataDirName), nil
-}
-
-func trayIcon() []byte {
-	img := image.NewRGBA(image.Rect(0, 0, 22, 22))
-	blue := color.RGBA{R: 46, G: 120, B: 210, A: 255}
-	for y := 0; y < 22; y++ {
-		for x := 0; x < 22; x++ {
-			img.Set(x, y, blue)
-		}
-	}
-	var buf []byte
-	var w = &byteWriter{buf: &buf}
-	if err := png.Encode(w, img); err != nil {
-		return nil
-	}
-	// png.Encode writes via Write; collect raw bytes.
-	return w.collected()
-}
-
-type byteWriter struct {
-	buf *[]byte
-}
-
-func (w *byteWriter) Write(p []byte) (int, error) {
-	*w.buf = append(*w.buf, p...)
-	return len(p), nil
-}
-
-func (w *byteWriter) collected() []byte {
-	return *w.buf
 }
 
 func openBrowser(url string) {

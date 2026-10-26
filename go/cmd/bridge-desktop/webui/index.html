@@ -23,7 +23,7 @@
   .badge { font-size: 12px; padding: 3px 10px; border-radius: 999px; }
   .badge.ok { background: #143d28; color: #46e08a; }
   .badge.no { background: #3d1518; color: #ff6b6b; }
-  input[type=text] {
+  input[type=text], input[type=password] {
     flex: 1; min-width: 160px; background: #11142a; border: 1px solid #2c3152;
     color: #e6e8f0; padding: 9px 12px; border-radius: 8px; font-size: 14px;
   }
@@ -47,6 +47,27 @@
 <main>
   <h1>Linktor Bridge</h1>
   <div class="sub">WhatsApp Multi-Device pareado localmente nesta máquina.</div>
+
+  <section class="card" id="gatewayCard">
+    <h2>Linktor</h2>
+    <div class="row">
+      <span class="badge no" id="bGateway">Verificando…</span>
+      <span class="sub" id="gwHint" style="margin:0"></span>
+    </div>
+    <div id="gwError" style="color:#ff6b6b;margin-top:8px"></div>
+    <div class="row" style="margin-top:12px">
+      <input type="text" id="gwServer" placeholder="wss://seu-linktor/api/v1/gateways/ws" style="flex-basis:100%">
+    </div>
+    <div class="row" style="margin-top:8px">
+      <input type="text" id="gwChannel" placeholder="ID do canal (whatsapp_remote)">
+      <input type="password" id="gwToken" placeholder="Token do bridge" autocomplete="off">
+    </div>
+    <div class="sub" style="margin-top:6px">Gere o token no Linktor (canal → token do bridge). Deixe em branco para manter o já salvo.</div>
+    <div class="row" style="margin-top:10px">
+      <button id="btnGwSave">Salvar e conectar</button>
+      <button class="danger" id="btnGwForget">Desconectar e esquecer</button>
+    </div>
+  </section>
 
   <section class="card" id="statusCard">
     <h2>Status da Conexão</h2>
@@ -114,7 +135,49 @@ const http = async (method, url, body) => {
   return res.json();
 };
 
+let gwEditing = false;
+async function refreshGateway() {
+  try {
+    const g = await http("GET", "/api/gateway");
+    const b = $("bGateway");
+    if (!g.configured) {
+      b.textContent = "Não configurado"; b.className = "badge no";
+      $("gwHint").textContent = "Informe servidor, canal e token do Linktor.";
+    } else if (g.connected) {
+      b.textContent = "Conectado ao Linktor"; b.className = "badge ok";
+      $("gwHint").textContent = g.server + " · canal " + g.channel_id.slice(0, 8) + "… · token " + g.token_hint;
+    } else {
+      b.textContent = "Desconectado"; b.className = "badge no";
+      $("gwHint").textContent = g.server + " · tentando reconectar";
+    }
+    $("gwError").textContent = g.last_error ? "Último erro: " + g.last_error : "";
+    if (!gwEditing) {
+      $("gwServer").value = g.server || "";
+      $("gwChannel").value = g.channel_id || "";
+      $("gwToken").placeholder = g.token_hint ? "Token salvo (" + g.token_hint + ")" : "Token do bridge";
+    }
+  } catch (err) {
+    $("gwError").textContent = "Erro: " + err.message;
+  }
+}
+for (const id of ["gwServer", "gwChannel", "gwToken"]) {
+  $(id).addEventListener("focus", () => { gwEditing = true; });
+}
+$("btnGwSave").onclick = async () => {
+  try {
+    await http("POST", "/api/gateway", { server: $("gwServer").value, channel_id: $("gwChannel").value, token: $("gwToken").value });
+    $("gwToken").value = ""; gwEditing = false;
+    $("gwError").textContent = "";
+  } catch (err) { $("gwError").textContent = "Erro: " + err.message; }
+  refreshGateway();
+};
+$("btnGwForget").onclick = async () => {
+  try { await http("DELETE", "/api/gateway"); gwEditing = false; } catch (err) { $("gwError").textContent = "Erro: " + err.message; }
+  refreshGateway();
+};
+
 async function refresh() {
+  refreshGateway();
   try {
     const s = await http("GET", "/api/status");
     $("bPaired").textContent = s.paired ? "Pareado" : "Não pareado";
@@ -125,7 +188,8 @@ async function refresh() {
     $("sError").textContent = s.last_error || "";
     $("sHint").hidden = s.paired;
     $("pairCard").hidden = s.paired;
-    if (s.qr_active) { $("qrWrap").hidden = false; $("qrImg").src = "/api/qr.png?" + Date.now(); }
+    $("qrWrap").hidden = !s.qr_active;
+    if (s.qr_active) $("qrImg").src = "/api/qr.png?" + Date.now();
   } catch (err) {
     $("sError").textContent = "Erro: " + err.message;
   }
@@ -141,7 +205,7 @@ $("btnQr").onclick = async () => {
     await http("POST", "/api/pair/qr");
     $("qrWrap").hidden = false;
     $("qrImg").src = "/api/qr.png?" + Date.now();
-    $("out").textContent = "Abra o WhatsApp > Dispositivos conectados > Conectar dispositivo e escaneie o QR.";
+    $("out").textContent = "Abra o WhatsApp > Dispositivos conectados > Conectar dispositivo e escaneie o QR. O código se renova sozinho enquanto o pareamento estiver aberto.";
   } catch (err) { $("out").textContent = "Erro: " + err.message; }
 };
 

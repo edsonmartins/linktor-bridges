@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,7 @@ import (
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 
 	"go.mau.fi/whatsmeow"
@@ -48,8 +50,21 @@ type core struct {
 	pairCtx   context.Context
 	pairStop  context.CancelFunc
 	pairError string
+	// currentQR é o último código emitido pelo WhatsApp. O servidor troca o
+	// código a cada ~20s; quem mostra o QR precisa ler sempre o atual.
+	currentQR string
 
 	inbound []InboundEvent
+
+	// mediaDir recebe as mídias baixadas; download é trocável nos testes e
+	// downloads limita quantos rodam ao mesmo tempo.
+	mediaDir  string
+	download  downloader
+	downloads chan struct{}
+
+	// sent lembra o que este bridge enviou, para separar eco de mensagem
+	// digitada no aparelho pareado.
+	sent *sentRegistry
 }
 
 // InboundEvent is a sanitized message received from WhatsApp, JSON-encoded for
@@ -60,9 +75,35 @@ type InboundEvent struct {
 	From       string `json:"from,omitempty"`
 	SenderName string `json:"sender_name,omitempty"`
 	Chat       string `json:"chat,omitempty"`
-	Text       string `json:"text,omitempty"`
-	Timestamp  int64  `json:"ts,omitempty"`
-	Summary    string `json:"summary,omitempty"`
+	// SenderLID é o endereço LID do remetente quando o WhatsApp o usou no
+	// lugar do número; From traz o número (PN) sempre que for conhecido.
+	SenderLID string `json:"sender_lid,omitempty"`
+	// IsFromMe marca mensagem digitada no aparelho pareado: From passa a ser
+	// o cliente (o chat) e OperatorName o nome de quem digitou.
+	IsFromMe     bool   `json:"is_from_me,omitempty"`
+	OperatorName string `json:"operator_name,omitempty"`
+	Text         string `json:"text,omitempty"`
+	Timestamp    int64  `json:"ts,omitempty"`
+	Summary      string `json:"summary,omitempty"`
+	// ContentType é text ou o tipo da mídia; MsgType guarda a variante do
+	// WhatsApp (ptt, sticker). Attachments vem com Path no disco.
+	ContentType string              `json:"content_type,omitempty"`
+	MsgType     string              `json:"msg_type,omitempty"`
+	Attachments []InboundAttachment `json:"attachments,omitempty"`
+	// Location vem com content_type "location"; não há arquivo a baixar.
+	Location *Location `json:"location,omitempty"`
+	// Recibo (Type "receipt"): Status delivered|read para cada MessageIDs,
+	// que são IDs de mensagens enviadas por este número.
+	Status     string   `json:"status,omitempty"`
+	MessageIDs []string `json:"message_ids,omitempty"`
+}
+
+// Location é um ponto compartilhado no WhatsApp (fixo ou ao vivo).
+type Location struct {
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+	Name      string  `json:"name,omitempty"`
+	Address   string  `json:"address,omitempty"`
 }
 
 // CallEventKind enumerates the call signaling events surfaced by the bridge.
@@ -139,6 +180,15 @@ func PairingError() string {
 	singleton.mu.Lock()
 	defer singleton.mu.Unlock()
 	return singleton.pairError
+}
+
+// CurrentQR returns the QR code currently valid for pairing, or "" when no QR
+// pairing is active. The code rotates while pairing runs, so callers should
+// re-read it instead of caching the first value.
+func CurrentQR() string {
+	singleton.mu.Lock()
+	defer singleton.mu.Unlock()
+	return singleton.currentQR
 }
 
 // CancelPairing stops an active QR or phone-code flow.
@@ -238,6 +288,14 @@ func (c *core) initialize(dataDir string) error {
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return fmt.Errorf("create store directory: %w", err)
 	}
+	mediaDir := filepath.Join(dataDir, mediaDirName)
+	if err := os.MkdirAll(mediaDir, 0o700); err != nil {
+		return fmt.Errorf("create media directory: %w", err)
+	}
+	c.mediaDir = mediaDir
+	if c.downloads == nil {
+		c.downloads = make(chan struct{}, maxConcurrentDownloads)
+	}
 	configureDeviceIdentity()
 
 	dbPath := filepath.Join(dataDir, "session.db")
@@ -263,7 +321,9 @@ func (c *core) initialize(dataDir string) error {
 		return fmt.Errorf("load device: %w", err)
 	}
 
-	client := whatsmeow.NewClient(device, nil)
+	// Log do protocolo em INFO: sem ele uma falha de pareamento (versão
+	// recusada, 405, etc.) não deixa rastro nenhum.
+	client := whatsmeow.NewClient(device, waLog.Stdout("whatsmeow", "INFO", true))
 	client.EnableAutoReconnect = true
 	client.AutoTrustIdentity = true
 	client.AddEventHandler(c.handleEvent)
@@ -280,22 +340,100 @@ func configureDeviceIdentity() {
 	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_CHROME.Enum()
 }
 
+// resolveSender devolve o JID de número (PN) do remetente e, quando ele veio
+// como LID, o LID original. Sem mapeamento conhecido, devolve o LID mesmo.
+func (c *core) resolveSender(sender, alt types.JID) (types.JID, string) {
+	if sender.Server != types.HiddenUserServer {
+		return sender, ""
+	}
+	lid := sender.String()
+	if alt.Server == types.DefaultUserServer && alt.User != "" {
+		return alt.ToNonAD(), lid
+	}
+	if c.client != nil && c.client.Store != nil && c.client.Store.LIDs != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if pn, err := c.client.Store.LIDs.GetPNForLID(ctx, sender); err == nil && pn.User != "" {
+			return pn.ToNonAD(), lid
+		}
+	}
+	return sender, lid
+}
+
 func (c *core) handleEvent(evt any) {
 	var event InboundEvent
 	switch v := evt.(type) {
 	case *events.Message:
-		text := v.Message.GetConversation()
-		if text == "" {
+		// IsFromMe sozinho não é eco: é também o que o atendente digita no
+		// aparelho pareado, metade de cada conversa. Eco é só o ID que nós
+		// mesmos distribuímos ao enviar.
+		if v.Info.IsFromMe && c.sent.isOurs(v.Info.ID, time.Now()) {
 			return
 		}
+		// Texto simples chega como Conversation; com prévia de link, resposta
+		// citada ou em vários clientes atuais, como ExtendedTextMessage. Mídia
+		// traz a legenda no próprio proto.
+		text := v.Message.GetConversation()
+		if text == "" {
+			text = v.Message.GetExtendedTextMessage().GetText()
+		}
+		media := extractMedia(v.Message)
+		if media != nil && text == "" {
+			text = media.caption
+		}
+		location := extractLocation(v.Message)
+		if location != nil && text == "" {
+			text = location.Name
+		}
+		if text == "" && media == nil && location == nil {
+			log.Printf("wacore: mensagem sem texto nem mídia ignorada (id=%s de %s)", v.Info.ID, v.Info.Sender.String())
+			return
+		}
+		// Remetente em LID: o Linktor identifica o contato pelo número, então
+		// traduz para o PN quando o WhatsApp informa (SenderAlt) ou quando o
+		// mapeamento já está na sessão. Sem tradução, segue o LID e a resposta
+		// volta por ele.
+		sender, senderLID := c.resolveSender(v.Info.Sender, v.Info.SenderAlt)
+		chat := v.Info.Chat
+		if chat.Server == types.HiddenUserServer && chat.User == v.Info.Sender.User {
+			chat = sender
+		}
+		senderName := v.Info.PushName
+		operatorName := ""
+		if v.Info.IsFromMe {
+			// Mensagem do próprio número: quem identifica a conversa é o
+			// cliente, que está no chat; o nome vai para operator_name para não
+			// renomear o contato com o nome do atendente.
+			sender, senderLID = c.resolveSender(v.Info.Chat, v.Info.RecipientAlt)
+			chat = sender
+			operatorName, senderName = senderName, ""
+		}
+		log.Printf("wacore: mensagem recebida (id=%s de %s lid=%s from_me=%t)", v.Info.ID, sender.String(), senderLID, v.Info.IsFromMe)
 		event = InboundEvent{
-			Type:       "message",
-			MessageID:  v.Info.ID,
-			From:       v.Info.Sender.String(),
-			SenderName: v.Info.PushName,
-			Chat:       v.Info.Chat.String(),
-			Text:       text,
-			Timestamp:  v.Info.Timestamp.Unix(),
+			Type:         "message",
+			MessageID:    v.Info.ID,
+			From:         sender.String(),
+			SenderName:   senderName,
+			Chat:         chat.String(),
+			SenderLID:    senderLID,
+			IsFromMe:     v.Info.IsFromMe,
+			OperatorName: operatorName,
+			Text:         text,
+			Timestamp:    v.Info.Timestamp.Unix(),
+			ContentType:  "text",
+		}
+		if location != nil {
+			event.ContentType = "location"
+			event.Location = location
+		}
+		if media != nil {
+			event.ContentType = media.kind
+			event.MsgType = media.msgType
+			event.Attachments = []InboundAttachment{media.attachment(v.Info.ID)}
+			// O download bloqueia e não pode segurar a goroutine de eventos do
+			// whatsmeow; o evento entra na fila quando o arquivo estiver no disco.
+			go c.enqueueAfterDownload(event, media)
+			return
 		}
 	case *events.CallOffer:
 		event = callEvent(CallOffer, v.From, v.CallID, v.Timestamp)
@@ -309,6 +447,33 @@ func (c *core) handleEvent(evt any) {
 		event = callEvent(CallReject, v.From, v.CallID, v.Timestamp)
 	case *events.CallTerminate:
 		event = callEvent(CallTerminate, v.From, v.CallID, v.Timestamp)
+	case *events.PairSuccess:
+		log.Printf("wacore: pareado como %s (%s)", v.ID.String(), v.Platform)
+		return
+	case *events.PairError:
+		log.Printf("wacore: pareamento falhou: %v", v.Error)
+		c.mu.Lock()
+		c.pairError = "pairing failed: " + v.Error.Error()
+		c.mu.Unlock()
+		return
+	case *events.Receipt:
+		// Só entregue e lido interessam ao Linktor; sender/retry/played-self são
+		// manutenção do protocolo. O Linktor casa os IDs com o que enviou e
+		// ignora o resto.
+		status := receiptStatus(v.Type)
+		log.Printf("wacore: recibo %q (%s) de %s para %d id(s): %v", v.Type, status, v.Chat.String(), len(v.MessageIDs), v.MessageIDs)
+		if status == "" || len(v.MessageIDs) == 0 {
+			return
+		}
+		from, _ := c.resolveSender(v.Chat, v.RecipientAlt)
+		event = InboundEvent{
+			Type:       "receipt",
+			From:       from.String(),
+			Chat:       from.String(),
+			Status:     status,
+			MessageIDs: v.MessageIDs,
+			Timestamp:  v.Timestamp.Unix(),
+		}
 	case *events.LoggedOut:
 		event = InboundEvent{Type: "logout", Summary: "session revoked"}
 	case *events.Connected:
@@ -319,12 +484,45 @@ func (c *core) handleEvent(evt any) {
 		return
 	}
 
+	c.enqueue(event)
+}
+
+// enqueue guarda o evento para DrainInbound, descartando os mais velhos se o
+// host não drena.
+func (c *core) enqueue(event InboundEvent) {
 	c.mu.Lock()
 	if len(c.inbound) >= 256 {
 		c.inbound = c.inbound[len(c.inbound)-128:]
 	}
 	c.inbound = append(c.inbound, event)
 	c.mu.Unlock()
+}
+
+// enqueueAfterDownload baixa a mídia (com limite de concorrência) e só então
+// enfileira o evento, com Path ou Error no anexo.
+func (c *core) enqueueAfterDownload(event InboundEvent, media *mediaPart) {
+	if c.downloads != nil {
+		c.downloads <- struct{}{}
+		defer func() { <-c.downloads }()
+	}
+	c.fetchMedia(event.MessageID, media, &event.Attachments[0])
+	if event.Attachments[0].Error != "" {
+		log.Printf("wacore: mídia de %s sem download: %s", event.MessageID, event.Attachments[0].Error)
+	}
+	c.enqueue(event)
+}
+
+// receiptStatus traduz o tipo de recibo do WhatsApp para o status do Linktor;
+// vazio para os tipos que não mudam status.
+func receiptStatus(t types.ReceiptType) string {
+	switch t {
+	case types.ReceiptTypeDelivered:
+		return "delivered"
+	case types.ReceiptTypeRead, types.ReceiptTypePlayed:
+		return "read"
+	default:
+		return ""
+	}
 }
 
 func callEvent(kind CallEventKind, from types.JID, callID string, ts time.Time) InboundEvent {
@@ -348,6 +546,7 @@ func (c *core) beginPairing() (string, error) {
 	for item := range qrChannel {
 		switch item.Event {
 		case whatsmeow.QRChannelEventCode:
+			c.currentQR = item.Code
 			go c.monitorPairing(qrChannel)
 			return item.Code, nil
 		case whatsmeow.QRChannelEventError:
@@ -430,12 +629,23 @@ func (c *core) startPairingLocked() (<-chan whatsmeow.QRChannelItem, error) {
 }
 
 func (c *core) monitorPairing(qrChannel <-chan whatsmeow.QRChannelItem) {
+	defer func() {
+		c.mu.Lock()
+		c.currentQR = ""
+		c.mu.Unlock()
+	}()
 	for item := range qrChannel {
 		if item.Event == whatsmeow.QRChannelSuccess.Event {
 			return
 		}
 		var message string
 		switch item.Event {
+		case whatsmeow.QRChannelEventCode:
+			// Código novo: o anterior já não vale no WhatsApp.
+			c.mu.Lock()
+			c.currentQR = item.Code
+			c.mu.Unlock()
+			continue
 		case whatsmeow.QRChannelEventError:
 			message = "pairing failed"
 			if item.Error != nil {
@@ -511,6 +721,7 @@ func (c *core) closeLocked() error {
 }
 
 func (c *core) cancelPairingLocked() {
+	c.currentQR = ""
 	if c.pairStop != nil {
 		c.pairStop()
 		c.pairStop = nil
@@ -529,33 +740,49 @@ func (c *core) sendText(destination, text, messageID string) (string, error) {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.client == nil {
-		return "", errors.New("core is not initialized")
+	if err := c.ensureReadyLocked(); err != nil {
+		return "", err
 	}
-	if !c.client.IsConnected() {
-		return "", errors.New("client is not connected")
-	}
-	if !c.client.WaitForConnection(readyTimeout) {
-		return "", errors.New("client is not connected and authenticated")
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), readyTimeout)
 	defer cancel()
-	message := &waProto.Message{Conversation: proto.String(text)}
-	var response whatsmeow.SendResponse
+	return c.sendMessageLocked(ctx, recipient, &waProto.Message{Conversation: proto.String(text)}, messageID)
+}
+
+// ensureReadyLocked confere que há sessão conectada e autenticada para enviar.
+func (c *core) ensureReadyLocked() error {
+	if c.client == nil {
+		return errors.New("core is not initialized")
+	}
+	if !c.client.IsConnected() {
+		return errors.New("client is not connected")
+	}
+	if !c.client.WaitForConnection(readyTimeout) {
+		return errors.New("client is not connected and authenticated")
+	}
+	return nil
+}
+
+// sendMessageLocked envia qualquer proto de mensagem; messageID vazio deixa o
+// whatsmeow gerar, ou reaproveita o ID dado para retry idempotente.
+func (c *core) sendMessageLocked(ctx context.Context, recipient types.JID, message *waProto.Message, messageID string) (string, error) {
+	var (
+		response whatsmeow.SendResponse
+		err      error
+	)
 	if messageID == "" {
 		response, err = c.client.SendMessage(ctx, recipient, message)
 	} else {
-		response, err = c.client.SendMessage(
-			ctx,
-			recipient,
-			message,
-			whatsmeow.SendRequestExtra{ID: types.MessageID(messageID)},
-		)
+		response, err = c.client.SendMessage(ctx, recipient, message, whatsmeow.SendRequestExtra{ID: types.MessageID(messageID)})
 	}
 	if err != nil {
 		return "", fmt.Errorf("send message: %w", err)
 	}
+	// Lembrado antes de devolver: o eco pode chegar enquanto o chamador ainda
+	// trata o resultado, e eco não lembrado vira mensagem duplicada.
+	if c.sent == nil {
+		c.sent = newSentRegistry()
+	}
+	c.sent.remember(response.ID, time.Now())
 	return response.ID, nil
 }
 
@@ -563,8 +790,8 @@ func normalizeDestination(raw string) (types.JID, error) {
 	value := strings.TrimSpace(raw)
 	if strings.Contains(value, "@") {
 		jid, err := types.ParseJID(value)
-		if err != nil || jid.User == "" || jid.Server != types.DefaultUserServer {
-			return types.EmptyJID, errors.New("invalid destination JID; use a user JID such as 5511999999999@s.whatsapp.net")
+		if err != nil || jid.User == "" || (jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer) {
+			return types.EmptyJID, errors.New("invalid destination JID; use a user JID such as 5511999999999@s.whatsapp.net or a @lid address")
 		}
 		return jid, nil
 	}

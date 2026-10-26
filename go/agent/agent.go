@@ -28,10 +28,23 @@ type Handler interface {
 	// SendText sends a text message and returns the WhatsApp message ID.
 	// messageID may be empty or a caller-persisted ID to reuse for idempotent retry.
 	SendText(to, text, messageID string) (string, error)
+	// SendMedia baixa a mídia da URL (já assinada pelo Linktor) e a envia com a
+	// legenda; devolve o ID da mensagem no WhatsApp.
+	SendMedia(to string, media OutboundMedia, caption, messageID string) (string, error)
 	// RejectCall rejects an incoming WhatsApp call (call signaling).
 	RejectCall(callFrom, callID string) error
 	// Status returns the current session snapshot as JSON (wacore.Status).
 	Status() (string, error)
+}
+
+// OutboundMedia é a mídia de um comando outbound: o Linktor manda a URL e o
+// host baixa, porque o frame não carrega bytes.
+type OutboundMedia struct {
+	Type     string `json:"type"` // image | video | audio | document
+	URL      string `json:"url"`
+	MimeType string `json:"mime_type,omitempty"`
+	Filename string `json:"filename,omitempty"`
+	PTT      bool   `json:"ptt,omitempty"`
 }
 
 // OutboundEvent is an event the bridge host wants forwarded to the gateway.
@@ -58,6 +71,12 @@ type Config struct {
 	// Outbound is a channel on which events (inbound messages, call signaling)
 	// are published so the host forwards them to the gateway.
 	Outbound chan OutboundEvent
+
+	// PrepareInbound, quando definido, ajusta o payload de um inbound na hora
+	// de enviar (o host usa para trocar caminhos de arquivo por base64) e
+	// devolve a limpeza a rodar depois da escrita. Assim só o frame em trânsito
+	// ocupa memória.
+	PrepareInbound func(payload []byte) (prepared []byte, cleanup func(), err error)
 }
 
 // Agent maintains the WebSocket connection to the Linktor gateway.
@@ -68,6 +87,40 @@ type Agent struct {
 
 	mu         sync.Mutex
 	lastStatus []byte
+
+	// Estado da ligação com o gateway, para o painel mostrar se o bridge está
+	// de fato falando com o Linktor (o "conectado" do WhatsApp é outra coisa).
+	connected   bool
+	connectedAt time.Time
+	lastError   string
+}
+
+// State é o retrato da ligação com o gateway.
+type State struct {
+	Connected   bool      `json:"connected"`
+	ConnectedAt time.Time `json:"connected_at,omitempty"`
+	LastError   string    `json:"last_error,omitempty"`
+}
+
+// State devolve o estado atual da ligação com o gateway.
+func (a *Agent) State() State {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return State{Connected: a.connected, ConnectedAt: a.connectedAt, LastError: a.lastError}
+}
+
+func (a *Agent) setConnected(ok bool, err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.connected = ok
+	if ok {
+		a.connectedAt = time.Now()
+		a.lastError = ""
+		return
+	}
+	if err != nil {
+		a.lastError = err.Error()
+	}
 }
 
 // New creates an Agent. server must be non-nil.
@@ -87,6 +140,13 @@ type Conn struct {
 	done chan struct{}
 }
 
+// maxReconnectBackoff limita a espera entre tentativas de reconexão. O caso
+// comum é o Linktor reiniciando por alguns segundos; com teto alto o bridge
+// ficava até 30s parado depois de o servidor voltar, e as mensagens do
+// atendente esperavam junto. Tentar a cada 5s contra um servidor fora do ar
+// não custa nada.
+const maxReconnectBackoff = 5 * time.Second
+
 // Run connects (with backoff) and serves the protocol until ctx is cancelled.
 // It is blocking; call it in its own goroutine.
 func (a *Agent) Run(ctx context.Context) {
@@ -99,6 +159,7 @@ func (a *Agent) Run(ctx context.Context) {
 		}
 
 		err := a.runOnce(ctx)
+		a.setConnected(false, err)
 		if ctx.Err() != nil {
 			return
 		}
@@ -110,10 +171,10 @@ func (a *Agent) Run(ctx context.Context) {
 			return
 		case <-time.After(backoff):
 		}
-		if backoff < 30*time.Second {
+		if backoff < maxReconnectBackoff {
 			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
+			if backoff > maxReconnectBackoff {
+				backoff = maxReconnectBackoff
 			}
 		}
 	}
@@ -249,6 +310,7 @@ func (a *Agent) handleFrame(ctx context.Context, conn *Conn, data []byte) error 
 			return fmt.Errorf("welcome rejected: %s", f.Error)
 		}
 		log.Printf("agent: welcome ok")
+		a.setConnected(true, nil)
 		if a.cfg.Outbound != nil {
 			go a.serveEvents(ctx, conn)
 		}
@@ -268,7 +330,15 @@ func (a *Agent) handleFrame(ctx context.Context, conn *Conn, data []byte) error 
 }
 
 func (a *Agent) execOutbound(f frame) frame {
-	messageID, err := a.server.SendText(f.To, f.Text, f.MessageID)
+	var (
+		messageID string
+		err       error
+	)
+	if f.Media != nil {
+		messageID, err = a.server.SendMedia(f.To, *f.Media, f.Text, f.MessageID)
+	} else {
+		messageID, err = a.server.SendText(f.To, f.Text, f.MessageID)
+	}
 	if err != nil {
 		return frame{
 			Type:          "ack",
@@ -320,7 +390,23 @@ func (a *Agent) serveEvents(ctx context.Context, conn *Conn) {
 			if evt.Kind == "call_event" {
 				frameType = "call_event"
 			}
-			_ = a.send(conn, frame{Type: frameType, ChannelID: a.cfg.ChannelID, Message: json.RawMessage(evt.Payload)})
+			payload := evt.Payload
+			var cleanup func()
+			if a.cfg.PrepareInbound != nil && frameType == "inbound" {
+				prepared, clean, err := a.cfg.PrepareInbound(payload)
+				if err != nil {
+					log.Printf("agent: inbound descartado: %v", err)
+					continue
+				}
+				payload, cleanup = prepared, clean
+			}
+			err := a.send(conn, frame{Type: frameType, ChannelID: a.cfg.ChannelID, Message: json.RawMessage(payload)})
+			if cleanup != nil {
+				cleanup()
+			}
+			if err != nil {
+				log.Printf("agent: falha ao enviar %s: %v", frameType, err)
+			}
 		}
 	}
 }
@@ -353,6 +439,7 @@ type frame struct {
 	Message       json.RawMessage `json:"message,omitempty"`
 	Status        json.RawMessage `json:"status,omitempty"`
 	TS            int64           `json:"ts,omitempty"`
+	Media         *OutboundMedia  `json:"media,omitempty"`
 }
 
 func sanitizeError(err error) string {
