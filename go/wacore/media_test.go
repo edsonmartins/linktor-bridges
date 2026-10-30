@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	waBinary "go.mau.fi/whatsmeow/binary"
 	waProto "go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -224,5 +225,36 @@ func TestReceiptForwarded(t *testing.T) {
 	}
 	if e := c.inbound[1]; e.Status != "read" {
 		t.Fatalf("read: %+v", e)
+	}
+}
+
+// Sinalização de chamada vira evento call com o call_id, quem ligou e o tipo
+// de sinal; a oferta diz se é videochamada pela faixa de vídeo do nó.
+func TestCallOfferForwarded(t *testing.T) {
+	c := &core{}
+	from := types.NewJID("5511999999999", types.DefaultUserServer)
+	c.handleEvent(&events.CallOffer{
+		BasicCallMeta: types.BasicCallMeta{From: from, CallID: "CALL1", Timestamp: time.Unix(1, 0)},
+		Data:          &waBinary.Node{Tag: "offer", Content: []waBinary.Node{{Tag: "audio"}, {Tag: "video"}}},
+	})
+	c.handleEvent(&events.CallOffer{
+		BasicCallMeta: types.BasicCallMeta{From: from, CallID: "CALL2", Timestamp: time.Unix(2, 0)},
+		Data:          &waBinary.Node{Tag: "offer", Content: []waBinary.Node{{Tag: "audio"}}},
+	})
+	c.handleEvent(&events.CallTerminate{BasicCallMeta: types.BasicCallMeta{From: from, CallID: "CALL2", Timestamp: time.Unix(3, 0)}})
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.inbound) != 3 {
+		t.Fatalf("fila com %d eventos, esperava 3", len(c.inbound))
+	}
+	video, voice, end := c.inbound[0], c.inbound[1], c.inbound[2]
+	if video.Type != "call" || video.MessageID != "CALL1" || video.Summary != "offer" || !video.Video || video.From != from.String() {
+		t.Fatalf("oferta de vídeo: %+v", video)
+	}
+	if voice.Video || voice.Summary != "offer" {
+		t.Fatalf("oferta de voz: %+v", voice)
+	}
+	if end.Summary != "terminate" || end.MessageID != "CALL2" || end.Timestamp != 3 {
+		t.Fatalf("término: %+v", end)
 	}
 }

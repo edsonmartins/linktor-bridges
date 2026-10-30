@@ -60,8 +60,9 @@ O resultado:
 - **Outbound** (Linktor → WhatsApp): o `RemoteAdapter` no servidor envia um
   comando pelo WS e aguarda ack com `message_id`; a bridge executa
   `wacore.SendText*` e confirma.
-- **Voz**: sinalização de chamada trafega como `call_event`/`call_command`
-  (incluindo rejeição); a engine de chamada (mlow/SRTP) roda na bridge.
+- **Chamadas**: só a sinalização trafega (`call_event` com oferta, aceite,
+  recusa e término; `call_command` para recusar). O áudio toca e é atendido no
+  aparelho pareado; o Linktor registra a chamada na conversa e pode recusá-la.
 - **Health**: `ping`/`pong` de aplicação + `bridge_health` no Channel
   (online/stale) para o Linktor saber se o canal está operante.
 
@@ -195,7 +196,7 @@ go build ./cmd/bridge-desktop
 - [x] `sender_name` (pushName) propagado no inbound
 - [x] Store durável de eventos na bridge (`eventstore`, SQLite local)
 - [x] Notificação nativa + tooltip no tray quando a bridge desconecta
-- [x] Voz: `call_event`/`call_command` + rejeição de chamada pela bridge
+- [x] Chamadas: `call_event`/`call_command` (sinalização e recusa; sem áudio)
 
 ### Roadmap
 

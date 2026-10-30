@@ -21,6 +21,7 @@ import (
 	"time"
 	"unicode"
 
+	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	waProto "go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store"
@@ -84,7 +85,11 @@ type InboundEvent struct {
 	OperatorName string `json:"operator_name,omitempty"`
 	Text         string `json:"text,omitempty"`
 	Timestamp    int64  `json:"ts,omitempty"`
-	Summary      string `json:"summary,omitempty"`
+	// Chamada (Type "call"): MessageID é o call_id, Summary a sinalização
+	// (offer, accept, preaccept, transport, reject, terminate) e Video marca
+	// oferta de videochamada. O áudio não passa pelo bridge.
+	Summary string `json:"summary,omitempty"`
+	Video   bool   `json:"video,omitempty"`
 	// ContentType é text ou o tipo da mídia; MsgType guarda a variante do
 	// WhatsApp (ptt, sticker). Attachments vem com Path no disco.
 	ContentType string              `json:"content_type,omitempty"`
@@ -437,6 +442,7 @@ func (c *core) handleEvent(evt any) {
 		}
 	case *events.CallOffer:
 		event = callEvent(CallOffer, v.From, v.CallID, v.Timestamp)
+		event.Video = isVideoOffer(v.Data)
 	case *events.CallAccept:
 		event = callEvent(CallAccept, v.From, v.CallID, v.Timestamp)
 	case *events.CallPreAccept:
@@ -523,6 +529,12 @@ func receiptStatus(t types.ReceiptType) string {
 	default:
 		return ""
 	}
+}
+
+// isVideoOffer lê no nó da oferta se há faixa de vídeo; chamada de voz só
+// traz <audio>.
+func isVideoOffer(offer *waBinary.Node) bool {
+	return offer != nil && len(offer.GetChildrenByTag("video")) > 0
 }
 
 func callEvent(kind CallEventKind, from types.JID, callID string, ts time.Time) InboundEvent {
