@@ -142,10 +142,15 @@ Em caso de falha: `"ok": false` e `"error"` com o motivo sanitizado (sem dados
 sensíveis). `correlation_id` ecoa o do `outbound`.
 
 **call_event** — sinalização de chamada. O WhatsApp só sinaliza; o áudio toca
-e é atendido no aparelho pareado, nunca passa pela bridge. O Linktor registra
-a chamada na conversa (`offer`), acompanha o desfecho (`accept`, `reject`,
-`terminate`) e pode recusar com `call_command`. `preaccept` e `transport`
-também são repassados, mas o Linktor os ignora.
+e é atendido no aparelho principal, nunca passa pela bridge. O Linktor
+registra a chamada na conversa (`offer`), guarda o primeiro desfecho
+(`accept` = atendida, `reject` = recusada, `terminate` com a chamada tocando
+= não atendida) e pode recusar com `call_command`. A bridge é um aparelho
+pareado: quando o principal atende, chegam o `accept` (do próprio número) e
+um `terminate` no mesmo instante, e o fim real da conversa nunca chega, por
+isso não há duração. Num aparelho pareado a oferta chega como aviso
+(`offer_notice` no whatsmeow) e é repassada como `offer`. `preaccept` e
+`transport` também são repassados, mas o Linktor os ignora.
 
 ```json
 {
