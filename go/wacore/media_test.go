@@ -251,9 +251,6 @@ func TestCallOfferForwarded(t *testing.T) {
 	if len(c.inbound) != 4 {
 		t.Fatalf("fila com %d eventos, esperava 4", len(c.inbound))
 	}
-	if notice := c.inbound[3]; notice.Summary != "offer" || notice.MessageID != "CALL3" || !notice.Video {
-		t.Fatalf("aviso de oferta: %+v", notice)
-	}
 	video, voice, end := c.inbound[0], c.inbound[1], c.inbound[2]
 	if video.Type != "call" || video.MessageID != "CALL1" || video.Summary != "offer" || !video.Video || video.From != from.String() {
 		t.Fatalf("oferta de vídeo: %+v", video)
@@ -263,5 +260,25 @@ func TestCallOfferForwarded(t *testing.T) {
 	}
 	if end.Summary != "terminate" || end.MessageID != "CALL2" || end.Timestamp != 3 {
 		t.Fatalf("término: %+v", end)
+	}
+	if notice := c.inbound[3]; notice.Summary != "offer" || notice.MessageID != "CALL3" || !notice.Video {
+		t.Fatalf("aviso de oferta: %+v", notice)
+	}
+}
+
+// Chamada sinalizada por LID segue com o número em From (mesmo contato das
+// mensagens) e o LID em SenderLID, que a recusa usa como endereço.
+func TestCallFromLIDResolvedToNumber(t *testing.T) {
+	c := &core{}
+	lid := types.NewJID("252415295144120", types.HiddenUserServer)
+	pn := types.NewJID("554499806761", types.DefaultUserServer)
+	c.handleEvent(&events.CallOfferNotice{BasicCallMeta: types.BasicCallMeta{From: lid, CallCreator: lid, CallCreatorAlt: pn, CallID: "L1", Timestamp: time.Unix(5, 0)}, Media: "audio"})
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.inbound) != 1 {
+		t.Fatalf("fila com %d eventos", len(c.inbound))
+	}
+	if e := c.inbound[0]; e.From != pn.String() || e.SenderLID != lid.String() {
+		t.Fatalf("identidade: from=%s lid=%s", e.From, e.SenderLID)
 	}
 }

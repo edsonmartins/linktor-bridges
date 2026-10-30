@@ -441,13 +441,13 @@ func (c *core) handleEvent(evt any) {
 			return
 		}
 	case *events.CallOffer:
-		event = callEvent(CallOffer, v.From, v.CallID, v.Timestamp)
+		event = c.callEvent(CallOffer, v.BasicCallMeta)
 		event.Video = isVideoOffer(v.Data)
 	case *events.CallOfferNotice:
 		// Num aparelho pareado (companion) a chamada 1:1 chega como aviso de
 		// oferta, não como a oferta completa: quem atende é o celular. Para o
 		// Linktor é a mesma coisa: a chamada começou a tocar.
-		event = callEvent(CallOffer, v.From, v.CallID, v.Timestamp)
+		event = c.callEvent(CallOffer, v.BasicCallMeta)
 		event.Video = v.Media == "video"
 	case *events.CallRelayLatency:
 		return
@@ -457,15 +457,15 @@ func (c *core) handleEvent(evt any) {
 		}
 		return
 	case *events.CallAccept:
-		event = callEvent(CallAccept, v.From, v.CallID, v.Timestamp)
+		event = c.callEvent(CallAccept, v.BasicCallMeta)
 	case *events.CallPreAccept:
-		event = callEvent(CallPreAccept, v.From, v.CallID, v.Timestamp)
+		event = c.callEvent(CallPreAccept, v.BasicCallMeta)
 	case *events.CallTransport:
-		event = callEvent(CallTransport, v.From, v.CallID, v.Timestamp)
+		event = c.callEvent(CallTransport, v.BasicCallMeta)
 	case *events.CallReject:
-		event = callEvent(CallReject, v.From, v.CallID, v.Timestamp)
+		event = c.callEvent(CallReject, v.BasicCallMeta)
 	case *events.CallTerminate:
-		event = callEvent(CallTerminate, v.From, v.CallID, v.Timestamp)
+		event = c.callEvent(CallTerminate, v.BasicCallMeta)
 	case *events.PairSuccess:
 		log.Printf("wacore: pareado como %s (%s)", v.ID.String(), v.Platform)
 		return
@@ -550,13 +550,19 @@ func isVideoOffer(offer *waBinary.Node) bool {
 	return offer != nil && len(offer.GetChildrenByTag("video")) > 0
 }
 
-func callEvent(kind CallEventKind, from types.JID, callID string, ts time.Time) InboundEvent {
-	log.Printf("wacore: chamada %s (id=%s de %s)", kind, callID, from.String())
+// callEvent monta o evento de chamada com a mesma identidade das mensagens:
+// From é o número quando o WhatsApp sinalizou por LID (senão a chamada abre
+// outro contato no Linktor) e SenderLID guarda o LID, que é o endereço que
+// a recusa precisa usar.
+func (c *core) callEvent(kind CallEventKind, meta types.BasicCallMeta) InboundEvent {
+	from, lid := c.resolveSender(meta.From, meta.CallCreatorAlt)
+	log.Printf("wacore: chamada %s (id=%s de %s lid=%s)", kind, meta.CallID, from.String(), lid)
 	return InboundEvent{
 		Type:      "call",
-		MessageID: callID,
+		MessageID: meta.CallID,
 		From:      from.String(),
-		Timestamp: ts.Unix(),
+		SenderLID: lid,
+		Timestamp: meta.Timestamp.Unix(),
 		Summary:   string(kind),
 	}
 }
