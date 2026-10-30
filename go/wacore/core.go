@@ -557,7 +557,7 @@ func isVideoOffer(offer *waBinary.Node) bool {
 func (c *core) callEvent(kind CallEventKind, meta types.BasicCallMeta) InboundEvent {
 	from, lid := c.resolveSender(meta.From, meta.CallCreatorAlt)
 	log.Printf("wacore: chamada %s (id=%s de %s lid=%s)", kind, meta.CallID, from.String(), lid)
-	return InboundEvent{
+	event := InboundEvent{
 		Type:      "call",
 		MessageID: meta.CallID,
 		From:      from.String(),
@@ -565,6 +565,31 @@ func (c *core) callEvent(kind CallEventKind, meta types.BasicCallMeta) InboundEv
 		Timestamp: meta.Timestamp.Unix(),
 		Summary:   string(kind),
 	}
+	if kind == CallOffer {
+		event.SenderName = c.contactName(from)
+	}
+	return event
+}
+
+// contactName é o nome de quem ligou na agenda da sessão. A chamada, ao
+// contrário da mensagem, não traz o pushName; sem isto quem liga antes de
+// mandar mensagem vira "Contato Desconhecido" no Linktor.
+func (c *core) contactName(jid types.JID) string {
+	if c.client == nil || c.client.Store == nil || c.client.Store.Contacts == nil || jid.Server != types.DefaultUserServer {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	info, err := c.client.Store.Contacts.GetContact(ctx, jid)
+	if err != nil {
+		return ""
+	}
+	for _, name := range []string{info.PushName, info.FullName, info.BusinessName} {
+		if name != "" {
+			return name
+		}
+	}
+	return ""
 }
 
 func (c *core) beginPairing() (string, error) {
