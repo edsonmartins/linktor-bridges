@@ -151,11 +151,18 @@ sem desparear o WhatsApp.
 ### Sem bandeja (Linux sem GTK/cgo, servidores, CI)
 
 ```bash
-CGO_ENABLED=0 go build -tags notray -o linktor-bridge ./cmd/bridge-desktop
-./linktor-bridge            # painel em http://127.0.0.1:7788; configure o Linktor por lá
+go run ./cmd/bridge-desktop        # painel em http://127.0.0.1:7788; configure o Linktor por lá
 ```
 
-Com `-tags notray` a bandeja fica de fora e o binário é 100% Go: o painel
+Numa máquina sem compilador C o Go desliga o cgo sozinho e a bandeja fica de
+fora, sem flag nenhuma. Com cgo disponível, `-tags notray` (ou
+`CGO_ENABLED=0`) força o mesmo resultado:
+
+```bash
+CGO_ENABLED=0 go build -tags notray -o linktor-bridge ./cmd/bridge-desktop
+```
+
+Sem a bandeja o binário é 100% Go: o painel
 continua em `127.0.0.1:<porta>` (a URL sai no terminal), o monitor de status
 loga as mudanças e Ctrl+C encerra. Notificações nativas seguem funcionando onde
 houver `notify-send`/D-Bus.

@@ -1,4 +1,4 @@
-//go:build notray
+//go:build !cgo || notray
 
 package main
 
