@@ -242,10 +242,17 @@ func TestCallOfferForwarded(t *testing.T) {
 		Data:          &waBinary.Node{Tag: "offer", Content: []waBinary.Node{{Tag: "audio"}}},
 	})
 	c.handleEvent(&events.CallTerminate{BasicCallMeta: types.BasicCallMeta{From: from, CallID: "CALL2", Timestamp: time.Unix(3, 0)}})
+	// aparelho pareado recebe a chamada 1:1 como aviso de oferta
+	c.handleEvent(&events.CallOfferNotice{BasicCallMeta: types.BasicCallMeta{From: from, CallID: "CALL3", Timestamp: time.Unix(4, 0)}, Media: "video"})
+	c.handleEvent(&events.CallRelayLatency{BasicCallMeta: types.BasicCallMeta{From: from, CallID: "CALL3"}})
+	c.handleEvent(&events.UnknownCallEvent{Node: &waBinary.Node{Tag: "mute"}})
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.inbound) != 3 {
-		t.Fatalf("fila com %d eventos, esperava 3", len(c.inbound))
+	if len(c.inbound) != 4 {
+		t.Fatalf("fila com %d eventos, esperava 4", len(c.inbound))
+	}
+	if notice := c.inbound[3]; notice.Summary != "offer" || notice.MessageID != "CALL3" || !notice.Video {
+		t.Fatalf("aviso de oferta: %+v", notice)
 	}
 	video, voice, end := c.inbound[0], c.inbound[1], c.inbound[2]
 	if video.Type != "call" || video.MessageID != "CALL1" || video.Summary != "offer" || !video.Video || video.From != from.String() {

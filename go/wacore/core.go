@@ -443,6 +443,19 @@ func (c *core) handleEvent(evt any) {
 	case *events.CallOffer:
 		event = callEvent(CallOffer, v.From, v.CallID, v.Timestamp)
 		event.Video = isVideoOffer(v.Data)
+	case *events.CallOfferNotice:
+		// Num aparelho pareado (companion) a chamada 1:1 chega como aviso de
+		// oferta, não como a oferta completa: quem atende é o celular. Para o
+		// Linktor é a mesma coisa: a chamada começou a tocar.
+		event = callEvent(CallOffer, v.From, v.CallID, v.Timestamp)
+		event.Video = v.Media == "video"
+	case *events.CallRelayLatency:
+		return
+	case *events.UnknownCallEvent:
+		if v.Node != nil {
+			log.Printf("wacore: evento de chamada desconhecido <%s>", v.Node.Tag)
+		}
+		return
 	case *events.CallAccept:
 		event = callEvent(CallAccept, v.From, v.CallID, v.Timestamp)
 	case *events.CallPreAccept:
@@ -538,6 +551,7 @@ func isVideoOffer(offer *waBinary.Node) bool {
 }
 
 func callEvent(kind CallEventKind, from types.JID, callID string, ts time.Time) InboundEvent {
+	log.Printf("wacore: chamada %s (id=%s de %s)", kind, callID, from.String())
 	return InboundEvent{
 		Type:      "call",
 		MessageID: callID,
