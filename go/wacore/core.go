@@ -21,6 +21,7 @@ import (
 	"time"
 	"unicode"
 
+	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	waProto "go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store"
@@ -84,7 +85,11 @@ type InboundEvent struct {
 	OperatorName string `json:"operator_name,omitempty"`
 	Text         string `json:"text,omitempty"`
 	Timestamp    int64  `json:"ts,omitempty"`
-	Summary      string `json:"summary,omitempty"`
+	// Chamada (Type "call"): MessageID é o call_id, Summary a sinalização
+	// (offer, accept, preaccept, transport, reject, terminate) e Video marca
+	// oferta de videochamada. O áudio não passa pelo bridge.
+	Summary string `json:"summary,omitempty"`
+	Video   bool   `json:"video,omitempty"`
 	// ContentType é text ou o tipo da mídia; MsgType guarda a variante do
 	// WhatsApp (ptt, sticker). Attachments vem com Path no disco.
 	ContentType string              `json:"content_type,omitempty"`
@@ -436,17 +441,31 @@ func (c *core) handleEvent(evt any) {
 			return
 		}
 	case *events.CallOffer:
-		event = callEvent(CallOffer, v.From, v.CallID, v.Timestamp)
+		event = c.callEvent(CallOffer, v.BasicCallMeta)
+		event.Video = isVideoOffer(v.Data)
+	case *events.CallOfferNotice:
+		// Num aparelho pareado (companion) a chamada 1:1 chega como aviso de
+		// oferta, não como a oferta completa: quem atende é o celular. Para o
+		// Linktor é a mesma coisa: a chamada começou a tocar.
+		event = c.callEvent(CallOffer, v.BasicCallMeta)
+		event.Video = v.Media == "video"
+	case *events.CallRelayLatency:
+		return
+	case *events.UnknownCallEvent:
+		if v.Node != nil {
+			log.Printf("wacore: evento de chamada desconhecido <%s>", v.Node.Tag)
+		}
+		return
 	case *events.CallAccept:
-		event = callEvent(CallAccept, v.From, v.CallID, v.Timestamp)
+		event = c.callEvent(CallAccept, v.BasicCallMeta)
 	case *events.CallPreAccept:
-		event = callEvent(CallPreAccept, v.From, v.CallID, v.Timestamp)
+		event = c.callEvent(CallPreAccept, v.BasicCallMeta)
 	case *events.CallTransport:
-		event = callEvent(CallTransport, v.From, v.CallID, v.Timestamp)
+		event = c.callEvent(CallTransport, v.BasicCallMeta)
 	case *events.CallReject:
-		event = callEvent(CallReject, v.From, v.CallID, v.Timestamp)
+		event = c.callEvent(CallReject, v.BasicCallMeta)
 	case *events.CallTerminate:
-		event = callEvent(CallTerminate, v.From, v.CallID, v.Timestamp)
+		event = c.callEvent(CallTerminate, v.BasicCallMeta)
 	case *events.PairSuccess:
 		log.Printf("wacore: pareado como %s (%s)", v.ID.String(), v.Platform)
 		return
@@ -525,14 +544,52 @@ func receiptStatus(t types.ReceiptType) string {
 	}
 }
 
-func callEvent(kind CallEventKind, from types.JID, callID string, ts time.Time) InboundEvent {
-	return InboundEvent{
+// isVideoOffer lê no nó da oferta se há faixa de vídeo; chamada de voz só
+// traz <audio>.
+func isVideoOffer(offer *waBinary.Node) bool {
+	return offer != nil && len(offer.GetChildrenByTag("video")) > 0
+}
+
+// callEvent monta o evento de chamada com a mesma identidade das mensagens:
+// From é o número quando o WhatsApp sinalizou por LID (senão a chamada abre
+// outro contato no Linktor) e SenderLID guarda o LID, que é o endereço que
+// a recusa precisa usar.
+func (c *core) callEvent(kind CallEventKind, meta types.BasicCallMeta) InboundEvent {
+	from, lid := c.resolveSender(meta.From, meta.CallCreatorAlt)
+	log.Printf("wacore: chamada %s (id=%s de %s lid=%s)", kind, meta.CallID, from.String(), lid)
+	event := InboundEvent{
 		Type:      "call",
-		MessageID: callID,
+		MessageID: meta.CallID,
 		From:      from.String(),
-		Timestamp: ts.Unix(),
+		SenderLID: lid,
+		Timestamp: meta.Timestamp.Unix(),
 		Summary:   string(kind),
 	}
+	if kind == CallOffer {
+		event.SenderName = c.contactName(from)
+	}
+	return event
+}
+
+// contactName é o nome de quem ligou na agenda da sessão. A chamada, ao
+// contrário da mensagem, não traz o pushName; sem isto quem liga antes de
+// mandar mensagem vira "Contato Desconhecido" no Linktor.
+func (c *core) contactName(jid types.JID) string {
+	if c.client == nil || c.client.Store == nil || c.client.Store.Contacts == nil || jid.Server != types.DefaultUserServer {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	info, err := c.client.Store.Contacts.GetContact(ctx, jid)
+	if err != nil {
+		return ""
+	}
+	for _, name := range []string{info.PushName, info.FullName, info.BusinessName} {
+		if name != "" {
+			return name
+		}
+	}
+	return ""
 }
 
 func (c *core) beginPairing() (string, error) {

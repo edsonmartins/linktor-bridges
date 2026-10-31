@@ -87,6 +87,34 @@ type gatewayRuntime struct {
 	events  chan agent.OutboundEvent
 	store   *eventstore.Store
 	handler outboundHandler
+	// recent é a cópia dos últimos eventos para o painel mostrar. O painel
+	// nunca lê a fila do wacore: DrainInbound consome, e um segundo leitor
+	// roubava eventos do Linktor (mensagens e sinais de chamada sumiam).
+	recent recentEvents
+}
+
+// recentEventsMax é quantos eventos o painel mostra.
+const recentEventsMax = 50
+
+// recentEvents guarda os últimos eventos drenados, mais novos no fim.
+type recentEvents struct {
+	mu    sync.Mutex
+	items []json.RawMessage
+}
+
+func (r *recentEvents) add(event json.RawMessage) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.items = append(r.items, event)
+	if over := len(r.items) - recentEventsMax; over > 0 {
+		r.items = append([]json.RawMessage(nil), r.items[over:]...)
+	}
+}
+
+func (r *recentEvents) snapshot() []json.RawMessage {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]json.RawMessage{}, r.items...)
 }
 
 func newGatewayRuntime(dataDir string, handler outboundHandler) (*gatewayRuntime, error) {
@@ -205,7 +233,8 @@ func (rt *gatewayRuntime) status() map[string]any {
 }
 
 // drainLoop move os eventos do wacore para o event store e, quando há agente
-// ligado, do store para o agente. Sem agente os eventos ficam no store.
+// ligado, do store para o agente. Sem agente os eventos ficam no store. É o
+// único leitor da fila do wacore (ver recentEvents).
 func (rt *gatewayRuntime) drainLoop() {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -218,6 +247,7 @@ func (rt *gatewayRuntime) drainLoop() {
 					if err != nil {
 						continue
 					}
+					rt.recent.add(data)
 					kind := "inbound"
 					if evt.Type == "call" {
 						kind = "call_event"

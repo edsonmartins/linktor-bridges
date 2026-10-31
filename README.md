@@ -60,8 +60,9 @@ O resultado:
 - **Outbound** (Linktor → WhatsApp): o `RemoteAdapter` no servidor envia um
   comando pelo WS e aguarda ack com `message_id`; a bridge executa
   `wacore.SendText*` e confirma.
-- **Voz**: sinalização de chamada trafega como `call_event`/`call_command`
-  (incluindo rejeição); a engine de chamada (mlow/SRTP) roda na bridge.
+- **Chamadas**: só a sinalização trafega (`call_event` com oferta, aceite,
+  recusa e término; `call_command` para recusar). O áudio toca e é atendido no
+  aparelho pareado; o Linktor registra a chamada na conversa e pode recusá-la.
 - **Health**: `ping`/`pong` de aplicação + `bridge_health` no Channel
   (online/stale) para o Linktor saber se o canal está operante.
 
@@ -150,11 +151,18 @@ sem desparear o WhatsApp.
 ### Sem bandeja (Linux sem GTK/cgo, servidores, CI)
 
 ```bash
-CGO_ENABLED=0 go build -tags notray -o linktor-bridge ./cmd/bridge-desktop
-./linktor-bridge            # painel em http://127.0.0.1:7788; configure o Linktor por lá
+go run ./cmd/bridge-desktop        # painel em http://127.0.0.1:7788; configure o Linktor por lá
 ```
 
-Com `-tags notray` a bandeja fica de fora e o binário é 100% Go: o painel
+Numa máquina sem compilador C o Go desliga o cgo sozinho e a bandeja fica de
+fora, sem flag nenhuma. Com cgo disponível, `-tags notray` (ou
+`CGO_ENABLED=0`) força o mesmo resultado:
+
+```bash
+CGO_ENABLED=0 go build -tags notray -o linktor-bridge ./cmd/bridge-desktop
+```
+
+Sem a bandeja o binário é 100% Go: o painel
 continua em `127.0.0.1:<porta>` (a URL sai no terminal), o monitor de status
 loga as mudanças e Ctrl+C encerra. Notificações nativas seguem funcionando onde
 houver `notify-send`/D-Bus.
@@ -195,7 +203,7 @@ go build ./cmd/bridge-desktop
 - [x] `sender_name` (pushName) propagado no inbound
 - [x] Store durável de eventos na bridge (`eventstore`, SQLite local)
 - [x] Notificação nativa + tooltip no tray quando a bridge desconecta
-- [x] Voz: `call_event`/`call_command` + rejeição de chamada pela bridge
+- [x] Chamadas: `call_event`/`call_command` (sinalização e recusa; sem áudio)
 
 ### Roadmap
 

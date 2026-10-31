@@ -141,6 +141,35 @@ Acima de 32 MB, ou quando o download falha, o anexo segue sem `data` e com
 Em caso de falha: `"ok": false` e `"error"` com o motivo sanitizado (sem dados
 sensíveis). `correlation_id` ecoa o do `outbound`.
 
+**call_event** — sinalização de chamada. O WhatsApp só sinaliza; o áudio toca
+e é atendido no aparelho principal, nunca passa pela bridge. O Linktor
+registra a chamada na conversa (`offer`), guarda o primeiro desfecho
+(`accept` = atendida, `reject` = recusada, `terminate` com a chamada tocando
+= não atendida) e pode recusar com `call_command`. A bridge é um aparelho
+pareado: quando o principal atende, chegam o `accept` (do próprio número) e
+um `terminate` no mesmo instante, e o fim real da conversa nunca chega, por
+isso não há duração. Num aparelho pareado a oferta chega como aviso
+(`offer_notice` no whatsmeow) e é repassada como `offer`. `preaccept` e
+`transport` também são repassados, mas o Linktor os ignora.
+
+```json
+{
+  "type": "call_event",
+  "channel_id": "wh-abc123",
+  "message": {
+    "type": "call",
+    "id": "AC2F1B...",                 // call_id do WhatsApp
+    "from": "5511999999999@s.whatsapp.net",
+    "ts": 1736950000,
+    "summary": "offer",               // offer | accept | preaccept | transport | reject | terminate
+    "video": true                     // só na oferta, quando é videochamada
+  }
+}
+```
+
+**call_ack** — resposta a um `call_command`, no mesmo formato do `ack`
+(`correlation_id` ecoado, `ok` e `error`).
+
 **bye** — encerramento limpo:
 
 ```json
@@ -182,6 +211,22 @@ OGG/Opus para isso).
   "text": "segue a foto",
   "media": { "type": "image", "url": "https://linktor/api/v1/media/k.jpg?exp=..&sig=..",
              "mime_type": "image/jpeg", "filename": "foto.jpg", "ptt": false }
+}
+```
+
+**call_command** — recusar uma chamada que está tocando. `from` é o JID de
+quem ligou (o `from` do `call_event`) e `call_id` o id da chamada; a bridge
+responde com `call_ack`. É o único comando de chamada: atender não existe,
+porque o áudio não passa por aqui.
+
+```json
+{
+  "type": "call_command",
+  "correlation_id": "c_125",
+  "channel_id": "wh-abc123",
+  "text": "reject",
+  "from": "5511999999999@s.whatsapp.net",
+  "call_id": "AC2F1B..."
 }
 ```
 

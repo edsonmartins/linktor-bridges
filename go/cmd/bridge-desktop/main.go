@@ -271,14 +271,9 @@ func newRouter(outbound outboundHandler) http.Handler {
 		}
 		writeJSON(w, map[string]any{"message_id": messageID})
 	})
+	// Só leitura: os últimos eventos que o bridge já pegou para o Linktor.
 	mux.HandleFunc("GET /api/inbound", func(w http.ResponseWriter, r *http.Request) {
-		events, err := wacore.DrainInbound()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(events))
+		writeJSON(w, gateway.recent.snapshot())
 	})
 	return mux
 }
