@@ -178,6 +178,19 @@ func (outboundHandler) RejectCall(callFrom, callID string) error {
 	return wacore.RejectCall(callFrom, callID)
 }
 
+func (outboundHandler) ContactAvatar(contact, existingID string) (agent.AvatarResult, error) {
+	avatar, err := wacore.LookupAvatar(contact, existingID)
+	if err != nil {
+		return agent.AvatarResult{}, err
+	}
+	return agent.AvatarResult{
+		PictureID: avatar.PictureID,
+		URL:       avatar.URL,
+		Unchanged: avatar.Unchanged,
+		Reason:    avatar.Reason,
+	}, nil
+}
+
 func (outboundHandler) Status() (string, error) {
 	return wacore.GetStatus()
 }
