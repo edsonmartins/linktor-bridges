@@ -33,6 +33,10 @@ type Handler interface {
 	SendMedia(to string, media OutboundMedia, caption, messageID string) (string, error)
 	// RejectCall rejects an incoming WhatsApp call (call signaling).
 	RejectCall(callFrom, callID string) error
+	// ContactAvatar consulta a foto de perfil de um contato (telefone, JID ou
+	// @lid), passando o pictureId que o Linktor já tem. "Sem foto", "oculta" e
+	// "sem sessão" voltam em AvatarResult.Reason; erro é falha de verdade.
+	ContactAvatar(contact, existingID string) (AvatarResult, error)
 	// Status returns the current session snapshot as JSON (wacore.Status).
 	Status() (string, error)
 }
@@ -45,6 +49,15 @@ type OutboundMedia struct {
 	MimeType string `json:"mime_type,omitempty"`
 	Filename string `json:"filename,omitempty"`
 	PTT      bool   `json:"ptt,omitempty"`
+}
+
+// AvatarResult é a resposta de Handler.ContactAvatar, no formato do frame
+// avatar_result. Reason vazio = há foto (URL) ou ela não mudou (Unchanged).
+type AvatarResult struct {
+	PictureID string
+	URL       string
+	Unchanged bool
+	Reason    string // not_set | hidden | not_connected
 }
 
 // OutboundEvent is an event the bridge host wants forwarded to the gateway.
@@ -322,6 +335,9 @@ func (a *Agent) handleFrame(ctx context.Context, conn *Conn, data []byte) error 
 	case "call_command":
 		resp := a.execCallCommand(f)
 		return a.send(conn, resp)
+	case "avatar_request":
+		resp := a.execAvatarRequest(f)
+		return a.send(conn, resp)
 	case "close":
 		_ = conn.ws.Close(websocket.StatusNormalClosure, "server closed: "+f.Reason)
 		return errors.New("closed by server: " + f.Reason)
@@ -371,6 +387,30 @@ func (a *Agent) execCallCommand(f frame) frame {
 		return frame{Type: "call_ack", ChannelID: a.cfg.ChannelID, CorrelationID: f.CorrelationID, OK: false, Error: sanitizeError(err)}
 	}
 	return frame{Type: "call_ack", ChannelID: a.cfg.ChannelID, CorrelationID: f.CorrelationID, OK: true}
+}
+
+// execAvatarRequest responde a consulta de foto do Linktor. O frame leva só a
+// URL do CDN: quem baixa os bytes é o Linktor, a imagem não passa pelo socket.
+func (a *Agent) execAvatarRequest(f frame) frame {
+	resp := frame{Type: "avatar_result", ChannelID: a.cfg.ChannelID, CorrelationID: f.CorrelationID}
+	if a.server == nil {
+		resp.Error = "bridge handler unavailable"
+		return resp
+	}
+	res, err := a.server.ContactAvatar(f.To, f.PictureID)
+	if err != nil {
+		resp.Error = sanitizeError(err)
+		return resp
+	}
+	if res.Reason != "" {
+		resp.Reason = res.Reason
+		return resp
+	}
+	resp.OK = true
+	resp.PictureID = res.PictureID
+	resp.URL = res.URL
+	resp.Unchanged = res.Unchanged
+	return resp
 }
 
 // serveEvents forwards events (messages + call signaling) to the gateway. The
@@ -440,6 +480,11 @@ type frame struct {
 	Status        json.RawMessage `json:"status,omitempty"`
 	TS            int64           `json:"ts,omitempty"`
 	Media         *OutboundMedia  `json:"media,omitempty"`
+	// avatar_request/avatar_result: PictureID é o que o Linktor já tem (pedido)
+	// ou a foto atual (resposta); URL é onde baixá-la.
+	PictureID string `json:"picture_id,omitempty"`
+	URL       string `json:"url,omitempty"`
+	Unchanged bool   `json:"unchanged,omitempty"`
 }
 
 func sanitizeError(err error) string {

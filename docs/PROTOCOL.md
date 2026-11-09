@@ -9,8 +9,8 @@ volta ao servidor Linktor e mantém a conexão viva.
 ```text
 bridge ──(WS wss://host/api/v1/gateways/ws?channel_id=...&token=...)──► linktor
   │  frames JSON bidirecionais:
-  │    bridge → linktor: hello, inbound, status, ack, bye
-  │    linktor → bridge: welcome, outbound, close
+  │    bridge → linktor: hello, inbound, status, ack, call_event, call_ack, avatar_result, bye
+  │    linktor → bridge: welcome, outbound, call_command, avatar_request, close
 ```
 
 - Sessão WhatsApp (whatsmeow) **vive na bridge**; o Linktor nunca toca no protocolo.
@@ -170,6 +170,25 @@ isso não há duração. Num aparelho pareado a oferta chega como aviso
 **call_ack** — resposta a um `call_command`, no mesmo formato do `ack`
 (`correlation_id` ecoado, `ok` e `error`).
 
+**avatar_result** — resposta a um `avatar_request`, no mesmo `correlation_id`.
+Leva a **URL** do CDN do WhatsApp, não a imagem: quem baixa os bytes é o
+Linktor, só de `https://*.whatsapp.net` ou `*.fbcdn.net`.
+
+```json
+{ "type": "avatar_result", "correlation_id": "c_126", "ok": true,
+  "picture_id": "1723456789", "url": "https://pps.whatsapp.net/v/t61..." }
+{ "type": "avatar_result", "correlation_id": "c_126", "ok": true,
+  "picture_id": "1723456789", "unchanged": true }       // o picture_id pedido ainda vale
+{ "type": "avatar_result", "correlation_id": "c_126", "ok": false, "reason": "not_set" }
+{ "type": "avatar_result", "correlation_id": "c_126", "ok": false, "reason": "hidden" }
+{ "type": "avatar_result", "correlation_id": "c_126", "ok": false, "reason": "not_connected" }
+{ "type": "avatar_result", "correlation_id": "c_126", "ok": false, "error": "..." }
+```
+
+`not_set` (contato sem foto) e `hidden` (o contato esconde a foto deste número)
+precisam vir distintos: quem guarda a foto apaga nos dois casos, mas só o
+`hidden` é escolha do titular. `not_connected` é a sessão do aparelho fora do ar.
+
 **bye** — encerramento limpo:
 
 ```json
@@ -227,6 +246,22 @@ porque o áudio não passa por aqui.
   "text": "reject",
   "from": "5511999999999@s.whatsapp.net",
   "call_id": "AC2F1B..."
+}
+```
+
+**avatar_request** — consultar a foto de perfil de um contato. `to` é o
+telefone com DDI, um JID de usuário ou um `@lid`; `picture_id`, opcional, é a
+foto que o Linktor já conhece — com ele o WhatsApp responde "não mudou" sem
+URL. A bridge responde com `avatar_result`. O Linktor desiste em 15s: bridge
+que não conhece este frame aparece como sessão indisponível, não trava nada.
+
+```json
+{
+  "type": "avatar_request",
+  "correlation_id": "c_126",
+  "channel_id": "wh-abc123",
+  "to": "5511999999999",
+  "picture_id": "1723456789"
 }
 ```
 

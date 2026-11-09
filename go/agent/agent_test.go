@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -71,7 +73,7 @@ func (m *mockServer) handleWS(w http.ResponseWriter, r *http.Request) {
 			_ = m.write(conn, frame{Type: "welcome", OK: true})
 		case "inbound", "status":
 			// record only
-		case "ack", "call_ack":
+		case "ack", "call_ack", "avatar_result":
 			m.acks <- f
 		}
 		if m.onFrame != nil {
@@ -110,6 +112,10 @@ type mockHandler struct {
 	sendErr  error
 	sent     chan sendCall
 	rejected chan rejectCall
+	// avatar/avatarErr respondem ContactAvatar; avatarAsked registra o pedido.
+	avatar      AvatarResult
+	avatarErr   error
+	avatarAsked chan [2]string
 }
 
 type sendCall struct {
@@ -141,6 +147,13 @@ func (h *mockHandler) RejectCall(callFrom, callID string) error {
 		h.rejected <- rejectCall{callFrom, callID}
 	}
 	return nil
+}
+
+func (h *mockHandler) ContactAvatar(contact, existingID string) (AvatarResult, error) {
+	if h.avatarAsked != nil {
+		h.avatarAsked <- [2]string{contact, existingID}
+	}
+	return h.avatar, h.avatarErr
 }
 
 func (h *mockHandler) Status() (string, error) {
@@ -400,5 +413,59 @@ func TestPrepareInboundRunsBeforeSend(t *testing.T) {
 	case <-cleaned:
 	case <-time.After(2 * time.Second):
 		t.Fatal("cleanup não rodou após o envio")
+	}
+}
+
+// TestAvatarRequest cobre a consulta de foto: o pedido chega ao host com o
+// pictureId que o Linktor tem, e a resposta volta como avatar_result no mesmo
+// correlation_id — foto, "não mudou", os dois motivos sem foto e a falha.
+func TestAvatarRequest(t *testing.T) {
+	cases := []struct {
+		name   string
+		avatar AvatarResult
+		err    error
+		check  func(frame) bool
+	}{
+		{"foto", AvatarResult{PictureID: "p2", URL: "https://pps.whatsapp.net/x"}, nil,
+			func(f frame) bool {
+				return f.OK && f.PictureID == "p2" && f.URL == "https://pps.whatsapp.net/x" && !f.Unchanged
+			}},
+		{"não mudou", AvatarResult{PictureID: "p1", Unchanged: true}, nil,
+			func(f frame) bool { return f.OK && f.Unchanged && f.PictureID == "p1" && f.URL == "" }},
+		{"sem foto", AvatarResult{Reason: "not_set"}, nil,
+			func(f frame) bool { return !f.OK && f.Reason == "not_set" }},
+		{"oculta", AvatarResult{Reason: "hidden"}, nil,
+			func(f frame) bool { return !f.OK && f.Reason == "hidden" }},
+		{"falha", AvatarResult{}, errors.New("iq timeout"),
+			func(f frame) bool { return !f.OK && f.Reason == "" && f.Error == "iq timeout" }},
+	}
+	for i, tc := range cases {
+		server := newMockServer(t, nil)
+		handler := &mockHandler{avatar: tc.avatar, avatarErr: tc.err, avatarAsked: make(chan [2]string, 1)}
+		ag := New(Config{ServerURL: server.url, ChannelID: "wh-abc", Token: "secret"}, handler)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		go ag.Run(ctx)
+
+		time.Sleep(300 * time.Millisecond)
+		corr := fmt.Sprintf("c_av_%d", i)
+		server.outboundCh <- frame{Type: "avatar_request", CorrelationID: corr, To: "5544999990000", PictureID: "p1"}
+
+		select {
+		case asked := <-handler.avatarAsked:
+			if asked != [2]string{"5544999990000", "p1"} {
+				t.Fatalf("%s: pedido = %v", tc.name, asked)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s: host não foi consultado", tc.name)
+		}
+		select {
+		case f := <-server.acks:
+			if f.Type != "avatar_result" || f.CorrelationID != corr || !tc.check(f) {
+				t.Fatalf("%s: resposta inesperada %+v", tc.name, f)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s: sem avatar_result", tc.name)
+		}
+		cancel()
 	}
 }
